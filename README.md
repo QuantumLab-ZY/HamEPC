@@ -27,6 +27,11 @@ cd HamEPC
 python setup.py install
 ```
 
+## Usage
+HamEPC supports hybrid parallelization of MPI and OpenMP. Users need to set the number of processes and threads reasonably in order to achieve optimal parallel efficiency and memory utilization.
+```
+mpirun -np ncores HamEPC --config EPC_input.yaml
+```
 ## Methods
 
 ### Smearing Function<a id="gauss_type"></a>
