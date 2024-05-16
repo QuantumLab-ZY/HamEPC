@@ -32,7 +32,7 @@ HamEPC supports hybrid parallelization of MPI and OpenMP. Users need to set the 
 ```
 mpirun -np ncores HamEPC --config EPC_input.yaml
 ```
-## Methods
+## Theory
 
 ### Smearing Function<a id="gauss_type"></a>
 
@@ -96,7 +96,7 @@ For `read_momentum = False`, we calculate the band velocity of electrons using:
 
 $$ \mathbf{v}_{\mathbf{k}n,\alpha} = \langle n\mathbf{k} | p_\alpha | n\mathbf{k} \rangle $$
 
-## Input Parameters
+## Explanation of Input Parameters
 
 To use this program, you should first set all the parameters in the basic block and then set the other blocks according to the required functionality.
 
