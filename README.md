@@ -17,13 +17,13 @@ The following Python libraries are required to calculate the epc values:
 - tqdm
 - scipy
 - yaml
-- The C extension numpy_extension is also needed. The installation method is `pip install numpy_extension-0.0.0-cp39-cp39-manylinux1_x86_64.whl`.
+- The C extension numpy_extension is also needed. The installation method is `pip install numpy_extension-0.0.3-cp39-cp39-manylinux1_x86_64.whl`.
 
 ## Installation
 Run the following command to install HamGNN:
 ```bash
-git clone https://github.com/QuantumLab-ZY/HamGNN.git
-cd EPC-HamGNN
+git clone https://github.com/QuantumLab-ZY/HamEPC.git
+cd HamEPC
 python setup.py install
 ```
 
