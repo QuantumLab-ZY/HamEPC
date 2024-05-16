@@ -1,5 +1,5 @@
 # EPC-HamNN
-
+A machine learning workflow based on HamGNN for calculating the electron-phonon coupling (EPC)
 ## Introduction
 The script EPC_calculator.py defines `EPC_calculator` class which is used to calculate the epc-related properties. This script also needs [HamGNN](https://github.com/QuantumLab-ZY/HamGNN) to predict the Hamiltonian matrix of a system.
 
