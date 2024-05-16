@@ -1,0 +1,33 @@
+basic:
+  cal_mode: 'superconduct'
+  graph_data_path_uc: ./graph_data.npz
+  nao_max: 19
+  Ham_type: openmx
+  outdir: './'
+
+phonon:
+  supercell_matrix: [[3.0, 0.0, 0.0], [0, 3, 0], [0, 0, 2]]
+  primitive_matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+  unitcell_filename: ./POSCAR
+  force_sets_filename: ./FORCE_SETS
+
+epc:
+  grad_mat_path: ./grad_mat.npy
+  mat_info_rc_path: ./mat_info_rc.npy
+  cell_range_cut: [2,2,2]
+
+transport:
+  k_size: [32,32,20]
+  q_size: [32,32,20]
+  bands_indices: [59,60,61,62,63,64,65,66]
+  temperature: 0.05 # K
+  phonon_cutoff: 0.5 # meV
+  smeark: 15 # meV
+  smearq: 0.5 # meV
+  gauss_type: 0 # the type of gaussian function
+  e_thr: 45 # meV commonly is 3 times degaussw
+
+superconduct:
+  mius: [0.05, 0.25, 0.01]
+  omega_range: [0, 50] # meV
+  omega_step: 0.01 # meV
