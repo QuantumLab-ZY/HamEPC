@@ -19,6 +19,14 @@ The following Python libraries are required to calculate the epc values:
 - yaml
 - The C extension numpy_extension is also needed. The installation method is `pip install numpy_extension-0.0.0-cp39-cp39-manylinux1_x86_64.whl`.
 
+## Installation
+Run the following command to install HamGNN:
+```bash
+git clone https://github.com/QuantumLab-ZY/HamGNN.git
+cd EPC-HamGNN
+python setup.py install
+```
+
 ## Methods
 
 ### Smearing Function<a id="gauss_type"></a>
@@ -49,7 +57,7 @@ We use some smearing methods to approximate the delta function.
 
 For mobility calculation in polar materials, we divide the electron-phonon coupling term into two parts using the method in [Phys. Rev. B 94, 20 (2016)](https://journals.aps.org/prb/abstract/10.1103/PhysRevB.94.201201):
 
-$${g}_{mn\nu}\left ( \mathbf{k}, \mathbf{q} \right ) = {g}^{\mathrm{S}}_{mn\nu}\left ( \mathbf{k}, \mathbf{q} \right ) + {g}^{\mathrm{L}}_{mn\nu}\left ( \mathbf{k}, \mathbf{q} \right ) $$
+$$ {g}_{mn\nu}\left ( \mathbf{k}, \mathbf{q} \right ) = {g}^{\mathrm{S}}_{mn\nu}\left ( \mathbf{k}, \mathbf{q} \right ) + {g}^{\mathrm{L}}_{mn\nu}\left ( \mathbf{k}, \mathbf{q} \right ) $$
 
 Then, we can split scattering rate into two parts, as:
 $$\left [ \frac{1}{\tau} \right ]_{\mathrm{Polar} } = \frac{2\pi}{\hbar} \sum_{\mathbf{q} m\nu } {\left | {g}^{\mathrm{L}}_{mn\nu}\left ( \mathbf{k}, \mathbf{q} \right )  \right | }^{2} F_{mn\nu}\left ( \mathbf{k}, \mathbf{q} \right )$$
