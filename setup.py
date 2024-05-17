@@ -35,7 +35,7 @@ setup(
     description='A machine learning workflow based on HamGNN for calculating the electron-phonon coupling (EPC).',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
-    url='https://github.com/QuantumLab-ZY/HamEPC.git',  # Replace with the actual URL of your project
+    url='https://github.com/QuantumLab-ZY/HamEPC.git',
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: MIT License',
