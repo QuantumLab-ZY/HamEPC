@@ -572,5 +572,6 @@ To use this program, you should first set all the parameters in the basic block 
 + Shixu Liu (Fudan University)
 
 ## Project leaders: 
-+ Hongjun Xiang  (Fudan University) 
++ Hongjun Xiang  (Fudan University)
++ Jihui Yang (Fudan University)
 + Xingao Gong  (Fudan University)
