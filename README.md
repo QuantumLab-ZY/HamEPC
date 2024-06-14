@@ -218,17 +218,17 @@ To use this program, you should first set all the parameters in the basic block 
 
 + `dispersion_select_index`:
 
-    When `calc_mode = 'band'`, it selects bands indices;
+    When `calc_mode = 'band'`, it selects bands indices as '1-3, 4-7';
 
-    When `calc_mode = 'phonon'`, it selects branches indices;
+    When `calc_mode = 'phonon'`, it selects branches indices as '1-2, 4-6';
 
-    When `calc_mode = 'epc'`, it must set as [band_indice_of_initial_state, band_indice_of_final_state];
+    When `calc_mode = 'epc'`, it must set as 'band_indice_of_initial_state, band_indice_of_final_state';
 
     Note that the indice starts from 1.
 
-    + default:&nbsp; &nbsp; []
+    + default:&nbsp; &nbsp; *ALL* for `calc_mode = 'band' or 'phonon'`, *MUST SET BY USER* for `calc_mode = 'epc'`
 
-    + options:&nbsp; &nbsp; *LIST[POSITIVE INTEGER]*
+    + options:&nbsp; &nbsp; *STRING*
 
 + `epc_path_fix_k`:
 

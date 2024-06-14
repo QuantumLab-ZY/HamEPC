@@ -306,20 +306,6 @@ default_parameters:dict[str, dict[str, Any]] = {
         'mius': [0.05, 0.25, 0.01],
         'omega_range': [0, 100], # meV
         'omega_step': 0.01,  # meV
-        'eliashberg': False,
-        'anisotropy': False,
-        'matsubara_cutoff': 10, # phonon cutoff frequency
-        'eff_Coul_pot': 0.15,
-        'BCS_ratio': 1.76,
-        'eliashberg_iter_max': 40,
-        'eliashberg_iter_thr': 0.00001,
-        'ME_solver_restart': False,
-    },
-    'breakdown': {
-        'fbd_erange': [0, 1, 0.01], # eV [emin, emax, estep]
-        'fbd_rate_file': '',
-        'fbd_effective_mass': 1.0,
-        'fbd_exp_bandgap': 0.0,
     },
 }
 

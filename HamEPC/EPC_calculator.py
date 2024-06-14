@@ -111,13 +111,6 @@ class EPC_calculator(object):
             self.graph_data.Moff = graph_data.Moff.numpy().reshape(-1, self.nao_max, self.nao_max, 3)
             self.graph_data.M_cell = self._M_cell_prepare() # shape: (ncells, nao_max, nao_max, 3)
 
-    def _initial_breakdown(self):
-        if (type(self.fbd_erange) != list) or (len(self.fbd_erange) != 3) or \
-            (type(self.fbd_erange[0]) != float) or (type(self.fbd_erange[1]) != float)or  (type(self.fbd_erange[2]) != float):
-            raise RuntimeError("The fbd_erange should be set as [emin, emax, estep]", '9604')
-        self.fbd_erange = np.array(self.fbd_erange) * Hamcts.EVtoHARTREE
-        self.fbd_exp_bandgap = self.fbd_exp_bandgap * Hamcts.EVtoHARTREE
-
     def _initial_superconduct(self):
         if (type(self.mius) != list) or (len(self.mius) != 3) or (type(self.mius[0]) != float) or (type(self.mius[1]) != float)or  (type(self.mius[2]) != float):
             raise RuntimeError("The mius should be set as [miu_min, miu_max, miu_step]", '6604')
@@ -384,6 +377,10 @@ class EPC_calculator(object):
             raise NotImplementedError
 
     def _parse_input(self, config:EasyDict):
+        
+        if 'advanced' in config.keys():
+            self._parse_input_optional(config=config, block_name='advanced')
+
         if 'basic' in config.keys():
             self._parse_input_basic(config=config)
             self._initial_basic()
@@ -392,22 +389,10 @@ class EPC_calculator(object):
             raise RuntimeError("You must set all parameters in basic part.", '1009')
 
         if 'advanced' in config.keys():
-            self._parse_input_optional(config=config, block_name='advanced')
             self._initial_advanced()
             del config['advanced']
 
-        if self.cal_mode == 'breakdown':
-            if self.rank == 0: print('#'*50+' Breakdown Calculation '+'#'*50)
-            self._parse_input_optional(config=config, block_name='phonon')
-            self._initial_phonon()
-            self._parse_input_optional(config=config, block_name='epc')
-            self._initial_epc()
-            self._parse_input_optional(config=config, block_name='transport')
-            self._initial_transport()
-            self._parse_input_optional(config=config, block_name='breakdown')
-            self._initial_breakdown()
-            del config['phonon'], config['epc'], config['transport'], config['breakdown']
-        elif self.cal_mode == 'mobility':
+        if self.cal_mode == 'mobility':
             if self.rank == 0: print('#'*50+' Mobility Calculation '+'#'*50)
             self._parse_input_optional(config=config, block_name='phonon')
             self._initial_phonon()
@@ -467,7 +452,7 @@ class EPC_calculator(object):
         self.Ham_type = config_basic.Ham_type.lower()
         self.outdir = config_basic.outdir
         # check
-        if self.cal_mode not in ['mobility', 'superconduct', 'band', 'phonon', 'epc', 'breakdown']:
+        if self.cal_mode not in ['mobility', 'superconduct', 'band', 'phonon', 'epc']:
             raise NotImplementedError('The calculation mode is not supported!', '1002')
         if self.Ham_type not in ['openmx', 'honpas', 'siesta']:
             raise NotImplementedError('The Hamitonian type is not supported!', '1003')
@@ -492,8 +477,6 @@ class EPC_calculator(object):
             self.superconductivity_cal()
         elif self.cal_mode == 'mobility':
             self.mobility_cal()
-        elif self.cal_mode == 'breakdown':
-            self.breakdown_cal()
 
     def _get_monkhorst_pack(self, mesh, shift=[0,0,0], return_frac: bool=False):
         """
@@ -1503,7 +1486,7 @@ class EPC_calculator(object):
             self.comm.Allreduce(MPI.IN_PLACE, a2f, op=MPI.SUM)
         return omegas_list, a2f
 
-    def _aniso_FSR_eliashberg_solve_restart(self, mfreqs:np.ndarray):
+
         if self.rank == 0:
             print("################################################## Anisotropic FSR Eliashberg Solver ##################################################")
 
@@ -2051,123 +2034,6 @@ class EPC_calculator(object):
             if self.rank == 0:
                 logger.step(send_rank+1)
         rate_all *= Hamcts.TWOPI
-        # The rate_all of the whole q is obtained by allreducing the rate_all of each process
-        if self.comm is not None:
-            self.comm.Allreduce(MPI.IN_PLACE, rate_all, op=MPI.SUM)
-        return rate_all
-
-    def rate_cal_fbd(self, k_grid, q_grid, ecbm):
-
-        nmodes = int(3) * self.natoms
-        nbands = len(self.bands_indices)
-        nks = len(k_grid)
-        nqs = len(q_grid)
-
-        longitude_branches = self._get_longitude_phonon_indice()
-
-        # get cbm plus over_cbm to obtain the energy range we focus on
-        efocus_min = ecbm + self.fbd_erange[0] - self.e_thr
-        efocus_max = ecbm + self.fbd_erange[1] + self.e_thr
-
-        rate_all = np.zeros((nbands, nks, 2))
-
-        # q points are parallelized and q grid is split
-        split_sections = np.zeros(self.rank_size, dtype=int)
-        for i in range(nqs):
-            split_sections[i%self.rank_size] += 1
-        split_sections = np.cumsum(split_sections, axis=0)
-        q_grid = np.split(q_grid, indices_or_sections=split_sections, axis=0)
-        # weights_q = np.split(self.weight_q, indices_or_sections=split_sections, axis=0)
-        # self.weight_q = None
-        if q_grid[self.rank].size>0:
-            # calculate the phonon spectrum in parallel
-            q_grid = q_grid[self.rank]
-            nqs_local = len(q_grid)
-            freq_grid, phon_vecs = self._phonon_cal(q_grid)
-            phon_vecs = phon_vecs.reshape(nqs_local, nmodes, self.natoms, 3)
-            # self.weight_q = weights_q[self.rank].copy()
-            # del weights_q
-            # change fractional coordinates to cartesian coordinates
-            q_grid = self._frac2car(q_grid)
-        else:
-            q_grid = np.empty((0, 3))
-            nqs_local = int(0)
-            freq_grid = np.empty((0, nmodes))
-            phon_vecs = np.empty((0, nmodes, self.natoms, 3))
-            # self.weight_q = np.empty(0)
-        
-        # k grid is split
-        if self.rank == 0:
-            print('k grid parallel is also switched on!')
-        split_sections = np.zeros(self.rank_size, dtype=int)
-        for i in range(nks):
-            split_sections[i%self.rank_size] += 1
-        split_sections = np.cumsum(split_sections, axis=0)
-        k_grid_all = np.split(k_grid, indices_or_sections=split_sections, axis=0)
-        if k_grid_all[self.rank].size > 0:            
-            # eigen: (norbs, nk_local) eigen_vecs: (nk_local, norbs, norbs)
-            eigen, eigen_vecs = self._elec_cal(k_grid_all[self.rank])
-            eigen = eigen[self.bands_indices, :]
-            eigen_vecs = eigen_vecs[:, self.bands_indices, :]
-        else:
-            eigen, eigen_vecs = np.empty((nbands, 0)), np.empty((0, nbands, self.norbs))
-
-        if self.rank == 0:
-            logger = time_logger(total_cycles=self.rank_size, routine_name='rate_cal_fbd')
-
-        ik_all = -1
-        for send_rank in range(self.rank_size):
-            eigen_vecs_recv, eigen_recv = self.comm.bcast((eigen_vecs, eigen), root=send_rank)
-            for ik, k in enumerate(k_grid_all[send_rank]):
-                ik_all += 1
-                eig_k, wave_k = eigen_recv[:, ik], eigen_vecs_recv[ik, :]
-                for ibnd in range(nbands):
-                    if (eig_k[ibnd] > efocus_max) or (eig_k[ibnd] < efocus_min):
-                        rate_all[ibnd, ik_all] = np.inf
-                        continue
-                    phase_k = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*k[None,:], axis=-1)) # shape: (ncells,)
-                    for iq, q in enumerate(q_grid):
-                        apply_correction_for_this_q = self.apply_correction and (np.linalg.norm(q) < self.q_cut)
-                        # phonon spectrum
-                        freq = freq_grid[iq]
-                        eigen_vec_phon = phon_vecs[iq]
-                        bose_qvs = bose_weight(freq, self.temperature)
-
-                        # calculate the electronic info for k+q
-                        kpq = k + q
-                        eig_kpq, wave_kpq = self._elec_cal([kpq])
-                        eig_kpq = eig_kpq[self.bands_indices, 0]
-                        wave_kpq = wave_kpq[0, self.bands_indices, :]
-                        match_table = self._get_match_table(eig_k, eig_kpq, freq)
-                        # cal epc
-                        phase_kpq = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*(kpq)[None,:], axis=-1)) # shape: (ncells,)
-                        for jbnd in range(nbands):
-                            tmp1 = np.einsum('m,n -> mn', np.conj(wave_kpq[jbnd]), wave_k[ibnd])
-                            # calculate epc
-                            for branch_idx in range(nmodes):
-                                if match_table[ibnd, jbnd, branch_idx]:
-                                    factor = 1.0 / np.sqrt(2.0 * self.atomic_mass * abs(freq[branch_idx])) # shape:(natoms,)
-                                    tmp2 = np.einsum('ij,mn -> mnij', factor[:,None]*eigen_vec_phon[branch_idx], tmp1)
-                                    epc = 0.0
-                                    for i_m, m in enumerate(self.cell_cut_list): # ncells
-                                        for i_n, n in enumerate(self.cell_cut_list): # ncells  
-                                            epc += np.conj(phase_kpq[m])*phase_k[n]*np.einsum('mnij,mnij', tmp2, self.grad_mat[i_m,i_n])
-                                    # Correction of long-range interactions
-                                    if apply_correction_for_this_q and (branch_idx in longitude_branches):
-                                        epc_corr = self._dipole_correction(tmp1, k, q, abs(freq_grid[iq, branch_idx]), eigen_vec_phon[branch_idx])
-                                    else:
-                                        epc_corr = 0.0
-                                    epc = epc + epc_corr
-                                    delta_f1 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] + freq[branch_idx]) * self.inv_smearq) * self.inv_smearq
-                                    delta_f2 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] - freq[branch_idx]) * self.inv_smearq) * self.inv_smearq
-                                    g2_tmp = np.abs(epc) * np.abs(epc)
-                                    rate_all[ibnd,ik_all,0] += g2_tmp * (bose_qvs[branch_idx] * delta_f1 + \
-                                                                    (bose_qvs[branch_idx] + 1.0) * delta_f2) # * self.weight_q[iq]
-                                    rate_all[ibnd,ik_all,1] += g2_tmp * ((bose_qvs[branch_idx] + 1.0) * delta_f2 - \
-                                                                    bose_qvs[branch_idx] * delta_f1) * freq[branch_idx] # * self.weight_q[iq]
-            if self.rank == 0:
-                logger.step(send_rank+1)
-        rate_all *= (Hamcts.TWOPI * self.weight_q)
         # The rate_all of the whole q is obtained by allreducing the rate_all of each process
         if self.comm is not None:
             self.comm.Allreduce(MPI.IN_PLACE, rate_all, op=MPI.SUM)
@@ -2780,7 +2646,7 @@ class EPC_calculator(object):
                 rate_ir = self.rate_cal_rmp(k_grid, q_grid, self.bands_indices, ecbm)
             else:
                 fout_name = 'rate_nk.dat'
-                rate_ir = self.rate_cal(k_grid, q_grid, self.bands_indices, ecbm, is_mrta=False)
+                rate_ir = self.rate_cal(k_grid, q_grid, self.bands_indices, ecbm)
 
             rate_ir[0, 0] = np.inf
             if self.rank == 0:
@@ -2815,101 +2681,6 @@ class EPC_calculator(object):
             print('       y       {:12.4e}      {:12.4e}      {:12.4e}'.format(*mobility[1]))
             print('       z       {:12.4e}      {:12.4e}      {:12.4e}'.format(*mobility[2]))
         return mobility
-
-    def breakdown_cal(self):
-        """
-        Calculate the breakdown field strength.
-
-        Args:
-
-        Returns:
-        """
-        k_grid, self.weight_k = self._get_ir_reciprocal_mesh(self.k_size, auxiliary_info=False)
-        # consider the spin factor
-        self.weight_k *= 2.0
-        # q grid can be sampling?
-        q_grid = self._get_monkhorst_pack(self.q_size, self.graph_data.latt, return_frac=True)
-        self.weight_q = 1.0 / len(q_grid)
-        band_edge_index = self.CBM_band_index
-        iband_edge = np.where(np.array(self.bands_indices)==band_edge_index)[0][0]
-        
-        enks, _ = self._elec_cal(k_grid) # (nbandtots, nk)
-        enks = enks[self.bands_indices, :] # (nbnd, nk)
-        
-        ecbm = self._get_ecbm(enks, iband_edge) 
-        if self.rank == 0:
-            print(f"CBM energy = {ecbm * Hamcts.HARTREEtoEV} eV")
-            
-        if self.fbd_rate_file:
-            if self.rank == 0:
-                rate_ir = np.full_like(enks, np.inf)
-                print(f"Reading scattering rate and energy loss rate from {self.fbd_rate_file}")
-                fin = open(self.fbd_rate_file, 'r')
-                lines = fin.readlines()
-                fin.close()
-                for line in lines[2:]:
-                    words = line.split()
-                    ik = int(words[0])
-                    ibnd = int(words[1])
-                    rate_ir[ibnd, ik, 0] = float(words[4])
-                    rate_ir[ibnd, ik, 1] = float(words[5])
-        else:
-            rate_ir = self.rate_cal_fbd(k_grid, q_grid, ecbm)
-            if self.rank == 0:
-                fout = open(os.path.join(self.outdir, 'fbd_rate_nk.dat'), 'w')
-                fout.write('ik    ibnd    weight_k    enk(Ry)    scattering_rate(Ry)    energy_loss_rate(Ry)\n')
-                for ik in range(len(enks[0])):
-                    for ibnd in range(len(self.bands_indices)):
-                        if not np.isinf(rate_ir[ibnd, ik, 0]):
-                            fout.write('{}  {}  {}  {}  {}  {}\n'.format(ik, ibnd, self.weight_k[ik], enks[ibnd, ik], rate_ir[ibnd, ik, 0], rate_ir[ibnd, ik, 1]))
-                fout.close()
-
-        if self.rank == 0:
-            ene_array = np.arange(self.fbd_erange[0], self.fbd_erange[1] + self.fbd_erange[2], self.fbd_erange[2])
-            inv_smears_array = 1.0 / np.arange(self.smeark, self.smeark * 10.1, self.smeark)
-            dos = np.zeros((len(ene_array), len(inv_smears_array)))
-            scatt_rate = np.zeros_like(dos)
-            eloss_rate = np.zeros_like(dos)
-
-            # for elements in rate_ir, we change inf to 0.0.
-            rate_ir[np.isinf(rate_ir)] = 0.0
-            for iene, ene in enumerate(ene_array):
-                for ismear, inv_smear_this in enumerate(inv_smears_array):
-                    delta_nks = w0gauss((enks - ecbm - ene) * inv_smear_this) * inv_smear_this
-                    dos[iene, ismear] = np.einsum('nk, k->', delta_nks, self.weight_k)
-                    scatt_rate[iene, ismear] = np.einsum('nk, nk, k->', rate_ir[:, :, 0], delta_nks, self.weight_k) / dos[iene, ismear]
-                    eloss_rate[iene, ismear] = np.einsum('nk, nk, k->', rate_ir[:, :, 1], delta_nks, self.weight_k) / dos[iene, ismear]
-
-            inv_smears_array = inv_smears_array / Hamcts.HARTREEtoMEV
-            fout = open(os.path.join(self.outdir, 'fbd_rate_ene.dat'), 'w')
-            fout.write("energy" + "      DOS      scattering-rate      energy-loss-rate" * len(inv_smears_array) + '\n')
-            fout.write("  eV  " + "     1/eV           1/ps                  eV/ps     " * len(inv_smears_array) + '\n')
-            fout.write(" ---- " + ''.join(["{:8.2f}meV  {:8.2f}meV  {:8.2f}meV".format(
-                1.0 / inv_smear, 1.0 / inv_smear, 1.0 / inv_smear) for inv_smear in inv_smears_array]) + '\n')
-            for iene, ene in enumerate(ene_array):
-                this_line_data = []
-                for ismear, _ in enumerate(inv_smears_array):
-                    this_line_data.extend([dos[iene, ismear] / Hamcts.HARTREEtoEV,
-                                           scatt_rate[iene, ismear] * Hamcts.HARTREEtoINVPS,
-                                           eloss_rate[iene, ismear] * Hamcts.HARTREEtoINVPS * Hamcts.HARTREEtoEV])
-                fout.write(str(round(ene * Hamcts.HARTREEtoEV, 6)) + "      " + "      ".join([str(round(each, 8)) for each in this_line_data]) + '\n')
-            fout.close()
-
-            fbd_array = np.sqrt(scatt_rate[:, 0] * Hamcts.HARTREEtoINVS * eloss_rate[:, 0] * Hamcts.HARTREEtoINVS * Hamcts.HARTREEtoJ) * \
-                    np.sqrt(3.0 * self.fbd_effective_mass * Hamcts.MASS_E) / Hamcts.EV
-
-            fbd_max = 0.0
-            dos_max = 0.0
-            for iene, ene in enumerate(ene_array):
-                if ene > self.fbd_exp_bandgap:
-                    break
-                if fbd_array[iene] > fbd_max:
-                    fbd_max = fbd_array[iene]
-                if dos[iene, 0] > dos_max:
-                    dos_max = dos[iene, 0]
-            
-            print(f"Density of states (1/eV): {dos_max / Hamcts.HARTREEtoEV}")
-            print(f"Breakdown field strength (MV/m): {fbd_max * 1.0E-6}")
 
     def _get_hsk_path(self, nks_path, hsk_points:list[list[float]]=None, hsk_labels:list[str]=None):
         """
@@ -3126,16 +2897,3 @@ class EPC_calculator(object):
             gnorm_save_all = np.concatenate(gnorm_save_all, axis=1) # (norbs, nk)
             np.save(os.path.join(self.outdir, "gnorm_save.npy"), arr=gnorm_save_all)
 
-if __name__ == '__main__':
-    epc_cal = EPC_calculator()
-    a2f_a = np.loadtxt('a2f-epw.dat')
-    omegas = a2f_a[:, 0] * Hamcts.MEVtoHARTREE
-    omega_step = omegas[1] - omegas[0]
-    epc_cal.omega_step = omega_step
-    a2f = a2f_a[:, 1]
-    lamb = epc_cal.epc_strength_cal(a2f, omegas)
-    print(lamb)
-    omega_log = epc_cal.logave_freq_cal(lamb, a2f, omegas)
-    print(omega_log * Hamcts.HARTREEtoMEV)
-    Tc = epc_cal.Allen_Dynes_Tc_cal(lamb, np.array([0.1]), omega_log)
-    print(Tc * Hamcts.HARTREEtoKELVIN)
