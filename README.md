@@ -1,6 +1,28 @@
 # HamEPC
 Electron-phonon coupling (EPC) calculator based on [HamGNN](https://github.com/QuantumLab-ZY/HamGNN)
 
+# Table of Contents
+1. [Introduction](#introduction)
+2. [Requirements](#requirements)
+3. [Installation](#installation)
+4. [Usage](#usage)
+5. [Theory](#theory)
+   1. [Smearing Function](#gauss_type)
+   2. [Scattering Rate in Polar Materials](#scatt_split)
+   3. [Monte Carlo Sampling](#monte_carlo)
+   4. [Band Velocity](#velocity)
+6. [Explanation of Input Parameters](#explanation-of-input-parameters)
+   1. [`basic`](#basic)
+   2. [`advanced`](#advanced)
+   3. [`dispersion`](#dispersion)
+   4. [`phonon`](#phonon)
+   5. [`epc`](#epc)
+   6. [`transport`](#transport)
+   7. [`mobility`](#mobility)
+   8. [`superconduct`](#superconduct)
+7. [Code contributors](#code-contributors)
+8. [Project leaders](#project-leaders)
+
 ## Introduction
 HamEPC is a machine learning workflow that leverages the HamGNN framework to efficiently calculate the electron-phonon coupling (EPC). By utilizing atomic orbital-based Hamiltonian matrices and gradients predicted by HamGNN, HamEPC is able to significantly accelerate EPC calculations compared to traditional density functional perturbation theory (DFPT) methods. HamEPC can be employed to evaluate important materials properties, including the electron-phonon coupling matrix, carrier mobility, and superconducting transition temperature. The script EPC_calculator.py defines `EPC_calculator` class which is used to calculate the epc-related properties. This script also needs HamGNN to predict the Hamiltonian matrix of a system.
 
@@ -544,3 +566,11 @@ To use this program, you should first set all the parameters in the basic block 
     + default:&nbsp; &nbsp; 0.01
 
     + options:&nbsp; &nbsp; *FLOAT*
+
+## Code contributors:
++ Yang Zhong (Fudan University) 
++ Shixu Liu (Fudan University)
+
+## Project leaders: 
++ Hongjun Xiang  (Fudan University) 
++ Xingao Gong  (Fudan University)
