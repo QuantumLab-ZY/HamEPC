@@ -23,7 +23,7 @@ from pymatgen.core.structure import Structure
 from pymatgen.symmetry.kpath import KPathSeek
 from pymatgen.core.periodic_table import Element
 from mpi4py import MPI
-from numpy_extension import eliashberg_spectrum_cal_helper_sparse, epc_elements_cal_helper_sparse
+from numpy_extension import eliashberg_spectrum_cal_helper_sparse
 
 class EPC_calculator(object):
 
