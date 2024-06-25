@@ -2651,8 +2651,8 @@ class EPC_calculator(object):
             rate_ir[0, 0] = np.inf
             if self.rank == 0:
                 fout = open(os.path.join(self.outdir, fout_name), 'w')
-                fout.write('ef = {} Ry    nc = {} Ry\n'.format(self.efermi, self.carrier_density))
-                fout.write('ik    ibnd    weight_k    enk(Ry)    scattering_rate(Ry)\n')
+                fout.write('ef = {} a.u.    nc = {} a.u.\n'.format(self.efermi, self.carrier_density))
+                fout.write('ik    ibnd    weight_k    enk(a.u.)    scattering_rate(a.u.)\n')
                 for ik in range(len(enks[0])):
                     for ibnd in range(len(self.bands_indices)):
                         if not np.isinf(rate_ir[ibnd, ik]):
