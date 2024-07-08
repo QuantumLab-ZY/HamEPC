@@ -14,6 +14,17 @@ setup(
     name='HamEPC',
     version='0.1',
     packages=find_packages(),
+    install_requires=[
+        "numpy",
+        "torch",
+        "torch_geometric",
+        "e3nn",
+        "pymatgen",
+        "tqdm",
+        "natsort",
+        'pyyaml',
+        'mpi4py'
+    ],
     entry_points={
         'console_scripts': [
             'HamEPC=HamEPC.run_EPC:main'
