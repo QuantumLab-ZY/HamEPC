@@ -894,7 +894,7 @@ def get_orb2atomidx(nao_max, species, Ham_type:str='openmx'):
 
 if __name__ == '__main__':
     cos = Constants()
-    print(cos.BOHRtoANG * 7.6099271072186741340646327724066)
+    print(cos.HARTREEtoINVPS * cos.HARTREEtoEV)
 
             
     
