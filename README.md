@@ -81,7 +81,7 @@ and also there are some variables need to be changed before running.
 
 + `system_name`: The name of the system. It affects the system name in OpenMX.
 
-+ `openmx_executable_path`: The path of OpenMX executable files, including *read_openmx* and *openmx_postprocess*. These two software can be obtained by compiling the code in the openmx_postprocess folder of the [HamGNN](https://github.com/QuantumLab-ZY/HamGNN) code repository.
++ `openmx_executable_path`: The path of OpenMX executable files, including *read_openmx* and *openmx_postprocess*. These two software can be obtained by compiling the code in the `openmx_postprocess` folder of the [HamGNN](https://github.com/QuantumLab-ZY/HamGNN) code repository.
 
 + `work_path`: The output path.
 
