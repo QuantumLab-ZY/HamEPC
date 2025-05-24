@@ -152,77 +152,10 @@ class EPC_calculator(object):
                 self.grad_mat = np.load(self.grad_mat_path)[self.cell_cut_array[:,None], self.cell_cut_array[None,:]]
         self.nbr_shift_of_cell_sc = np.einsum('ni, ij -> nj', self.cell_shift_array_reduced, self.graph_data.latt) # shape: (ncells, 3)
         if self.apply_correction:
-            # The mapping from orbital index to atomic index
-            self.orb2atomidx = get_orb2atomidx(self.nao_max, self.graph_data.species, Ham_type=self.Ham_type)
-            # Looking for the cell_shift after expanding.        
-            cell_shift_array_expand = []
-            nbr_range = 9
-            ncells = len(self.graph_data.cell_shift_array)
-            for i in range(-nbr_range, nbr_range+1):
-                for j in range(-nbr_range, nbr_range+1):
-                    for k in range(-nbr_range, nbr_range+1):
-                        if (i,j,k) not in self.cell_index_map:         
-                            cell_shift_array_expand.append([i,j,k])
-    
-            self.cell_shift_array_expand = np.array(cell_shift_array_expand) # shape: (ncells_expand, 3)
-            self.ncells_expand = ncells + len(self.cell_shift_array_expand)
-            self.nbr_shift_of_cell_expand = np.einsum('ni, ij -> nj', self.cell_shift_array_expand, self.graph_data.latt) # shape: (ncells_expand, 3)
-            
-            self.n_list_1 = [] # usage: for i, n in enumerate(n_list_1[m])
-            self.relative_cell_mn_list_1 = [] # usage: relative_cell_mn = relative_cell_mn_list_1[m][i]
-            for m, Cm in enumerate(self.graph_data.cell_shift_array): # ncells
-                tmp_list = []
-                tmp_relative_list = []
-                for n, Cn in enumerate(self.graph_data.cell_shift_array): # ncells
-                    relative_cell_shift = tuple((Cn - Cm).tolist())
-                    if relative_cell_shift in self.cell_index_map:
-                        relative_cell_mn = self.cell_index_map[relative_cell_shift] 
-                        tmp_list.append(n)
-                        tmp_relative_list.append(relative_cell_mn)
-                self.n_list_1.append(tmp_list)
-                self.relative_cell_mn_list_1.append(tmp_relative_list)
-                
-            self.n_list_2 = [] # usage: for i, n in enumerate(n_list_2[m])
-            self.relative_cell_mn_list_2 = [] # usage: relative_cell_mn = relative_cell_mn_list_2[m][i]
-            for m, Cm in enumerate(self.cell_shift_array_expand): # ncells_expand
-                tmp_list = []
-                tmp_relative_list = []
-                for n, Cn in enumerate(self.cell_shift_array_expand): # ncells_expand
-                    relative_cell_shift = tuple((Cn - Cm).tolist())
-                    if relative_cell_shift in self.cell_index_map:
-                        relative_cell_mn = self.cell_index_map[relative_cell_shift] 
-                        tmp_list.append(n)
-                        tmp_relative_list.append(relative_cell_mn)
-                self.n_list_2.append(tmp_list)
-                self.relative_cell_mn_list_2.append(tmp_relative_list)
-            
-            self.n_list_3 = [] # usage: for i, n in enumerate(n_list_3[m])
-            self.relative_cell_mn_list_3 = [] # usage: relative_cell_mn = relative_cell_mn_list_3[m][i]
-            for m, Cm in enumerate(self.graph_data.cell_shift_array): # ncells
-                tmp_list = []
-                tmp_relative_list = []
-                for n, Cn in enumerate(self.cell_shift_array_expand): # ncells_expand
-                    relative_cell_shift = tuple((Cn - Cm).tolist())
-                    if relative_cell_shift in self.cell_index_map:
-                        relative_cell_mn = self.cell_index_map[relative_cell_shift] 
-                        tmp_list.append(n)
-                        tmp_relative_list.append(relative_cell_mn)
-                self.n_list_3.append(tmp_list)
-                self.relative_cell_mn_list_3.append(tmp_relative_list)
-
-            self.n_list_4 = [] # usage: for i, n in enumerate(n_list_4[m])
-            self.relative_cell_mn_list_4 = [] # usage: relative_cell_mn = relative_cell_mn_list_4[m][i]
-            for m, Cm in enumerate(self.cell_shift_array_expand): # ncells_expand
-                tmp_list = []
-                tmp_relative_list = []
-                for n, Cn in enumerate(self.graph_data.cell_shift_array): # ncells
-                    relative_cell_shift = tuple((Cn - Cm).tolist())
-                    if relative_cell_shift in self.cell_index_map:
-                        relative_cell_mn = self.cell_index_map[relative_cell_shift] 
-                        tmp_list.append(n)
-                        tmp_relative_list.append(relative_cell_mn)
-                self.n_list_4.append(tmp_list)
-                self.relative_cell_mn_list_4.append(tmp_relative_list)
+            if self.LRC_taylor_order == 1:
+                self.graph_data.P_cell = self._P_cell_prepare()
+            # 4 * alpha
+            self.ewald_param = 4.0 * Hamcts.EWALD_SCALE * np.power(Hamcts.TWOPI / np.linalg.norm(self.graph_data.latt[0]), 2)
         
     def _initial_basic(self):
         if not (os.path.isfile(self.graph_data_path_uc) and os.access(self.graph_data_path_uc, os.R_OK)):
@@ -244,6 +177,9 @@ class EPC_calculator(object):
         else:
             self.graph_data.Hon = graph_data.Hon.numpy().reshape(-1, self.nao_max, self.nao_max)
             self.graph_data.Hoff = graph_data.Hoff.numpy().reshape(-1, self.nao_max, self.nao_max)
+        if ('Pon' in graph_data.keys) and ('Poff' in graph_data.keys):
+            self.graph_data.Pon = graph_data.Pon.numpy().reshape(-1, self.nao_max, self.nao_max, 3)
+            self.graph_data.Poff = graph_data.Poff.numpy().reshape(-1, self.nao_max, self.nao_max, 3)
         self.graph_data.latt = graph_data.cell.numpy().reshape(3,3)
         self.graph_data.lat_per_inv = np.linalg.inv(self.graph_data.latt).T
         self.graph_data.cell_shift = graph_data.cell_shift.numpy()
@@ -500,7 +436,7 @@ class EPC_calculator(object):
         else:
             k_vec = np.tensordot(k_grids, self.graph_data.lat_per_inv, axes=1) # (nk, 3)
             return k_vec
-        
+
     def _frac2car(self, k_grids):
         """2*pi constant is missed.
         Args:
@@ -509,13 +445,15 @@ class EPC_calculator(object):
         Returns:
             _type_: _description_
         """
+        k_grids = k_grids.reshape(-1, 3)
         k_vec = np.tensordot(k_grids, self.graph_data.lat_per_inv, axes=1)
         return k_vec
 
     def _car2frac(self, k_grids):
+        k_grids = k_grids.reshape(-1, 3)
         k_vec = np.tensordot(k_grids, self.graph_data.latt.T, axes=1)
         return k_vec
-    
+
     def _get_ir_reciprocal_mesh(self, mesh, shift=[0,0,0], auxiliary_info=False, return_frac:bool=False):
         """Calculate the k-point grid and weights in the irreducible Brillouin zone
 
@@ -580,7 +518,7 @@ class EPC_calculator(object):
         freq_grid = np.stack(freq_grid, axis=0) * Hamcts.PHONOPYtoHARTREE # shape: (nq, nbranches)
         phon_vecs= np.stack(phon_vecs, axis=0) # shape: (nq, nbranches, nbranches)
         return freq_grid, phon_vecs
-    
+
     def _get_longitude_phonon_indice(self):
         return [2, 5]
 
@@ -613,7 +551,7 @@ class EPC_calculator(object):
         eigen_vecs = eigen_vecs*lamda[:,:,None]
         
         return eigen, eigen_vecs
-        
+
     def EPC_cal_path(self, k_fix, q_paths, band_ini, band_fin, do_symm:bool=True):
         """
         Args:
@@ -660,7 +598,7 @@ class EPC_calculator(object):
 
                 # Correction of long-range interactions
                 if self.apply_correction and (np.linalg.norm(q) < self.q_cut):
-                    epc_corr = self._dipole_correction(tmp1, k_fix, q, freq[branch_idx], eigen_vec_phon[branch_idx])
+                    epc_corr = self._dipole_correction(tmp1, k_fix, q, factor, eigen_vec_phon[branch_idx])
                 else:
                     epc_corr = 0.0
                 epc_all.append(epc + epc_corr)
@@ -786,7 +724,7 @@ class EPC_calculator(object):
         g_vec = np.tensordot(g_grid, self.graph_data.lat_per_inv, axes=1) # (ng, 3)
         return g_vec
     
-    def _dipole_correction_fast(self, wave_coe_tp, k_vec, q_vec, freq, phon_vec):
+    def _dipole_correction(self, wave_coe_tp:np.ndarray, k_vec:np.ndarray, q_vec:np.ndarray, ph_prefac:np.ndarray, phon_vec:np.ndarray):
         """
         Args:
             wave_coe_tp (np.array): (norbs, norbs)
@@ -797,151 +735,50 @@ class EPC_calculator(object):
 
         Returns:
             ret: scalar
-        """        
-        atomic_mass = self.atomic_mass
-        
-        if np.allclose(q_vec, np.array([0.0,0.0,0.0])):
-            G_vec = self._get_reciprocal_lattice_vectors(3,3,3, True) # (ng, 3)
-        else:
-            G_vec = self._get_reciprocal_lattice_vectors(3,3,3, False) # (ng, 3)
-        tao_k = self.graph_data.pos # (natoms, 3)
-        tao_k = tao_k[self.orb2atomidx] # (norbs, 3)
-
-        phase1 = np.exp(-2j*np.pi*np.sum(self.graph_data.nbr_shift_of_cell*k_vec[None,:], axis=-1)) # shape: (ncells,)
-        phase2 = np.exp(2j*np.pi*np.sum((tao_k[None,:,:]-self.graph_data.nbr_shift_of_cell[:,None,:])*q_vec[None,None,:], axis=-1)) # shape: (ncells,norbs)
-
-        S_cell = self.graph_data.S_cell
-        
-        # P_cell = self.graph_data.P_cell
-        # S_cell = S_cell-2j*np.pi*np.einsum('nijk, k->nij', P_cell, q_vec)
-        inner_product = oe.contract('ij, m, mi, mij', wave_coe_tp, phase1, phase2, S_cell)
-        
-        temp1 = Hamcts.TWOPI*np.einsum('gi,kij,kj -> kg', q_vec[None,:]+G_vec, self.BECs, phon_vec) # shape: (natoms, ng)
-        temp2 = Hamcts.TWOPI_SQUARE*np.einsum('gi,ij,gj -> g', q_vec[None,:]+G_vec, self.DL, q_vec[None,:]+G_vec) # shape: (ng,)
-        temp3 = temp1/temp2[None,:] # shape: (natoms, ng)
-        
-        temp4 = (temp3*inner_product).sum(-1) # shape: (natoms,)
-        temp5 = np.sqrt(1/(2.0*atomic_mass*freq)) # shape: (natoms,)
-        
-        ret = Hamcts.JFOURPI*(temp4*temp5).sum()/self.volume_uc
-        
-        return ret
-
-    def _dipole_correction(self, wave_coe_tp, k_vec, q_vec, freq, phon_vec):
         """
-        Args:
-            wave_coe_tp (np.array): (norbs, norbs)
-            k_vec (np.array): (3,)
-            q_vec (np.array): (3)
-            freq (np.array): (nbranches,)
-            phon_vec (np.array): (natoms, 3)
-
-        Returns:
-            ret: scalar
-        """        
-        atomic_mass = self.atomic_mass
-        
-        if np.allclose(q_vec, np.array([0.0,0.0,0.0])):
-            G_vec = self._get_reciprocal_lattice_vectors(3,3,3, True) # (ng, 3)
-        else:
-            G_vec = self._get_reciprocal_lattice_vectors(3,3,3, False) # (ng, 3)
-        # tao_k = self.graph_data.pos # (natoms, 3)
-        
-        # # Looking for the cell_shift after expanding.        
-        # cell_shift_array_expand = []
-        # nbr_range = 3
-        # ncells = len(self.graph_data.cell_shift_array)
-        # for i in range(-nbr_range, nbr_range+1):
-        #     for j in range(-nbr_range, nbr_range+1):
-        #         for k in range(-nbr_range, nbr_range+1):
-        #             if (i,j,k) not in self.cell_index_map:         
-        #                 cell_shift_array_expand.append([i,j,k])
-
-        # cell_shift_array_expand = np.array(cell_shift_array_expand) # shape: (ncells_expand, 3)
-        # ncells_expand = ncells + len(self.cell_shift_array_expand)
-
-        phase1 = np.exp(-Hamcts.JTWOPI*np.sum(self.graph_data.nbr_shift_of_cell*(k_vec+q_vec)[None,:], axis=-1)) # shape: (ncells,)
-        phase2 = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.nbr_shift_of_cell*k_vec[None,:], axis=-1)) # shape: (ncells,)
-        
-        # nbr_shift_of_cell_expand = np.einsum('ni, ij -> nj', self.cell_shift_array_expand, self.graph_data.latt) # shape: (ncells_expand, 3)
-        phase1_expand = np.exp(-Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_expand*(k_vec+q_vec)[None,:], axis=-1)) # shape: (ncells_expand,)
-        phase2_expand = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_expand*k_vec[None,:], axis=-1)) # shape: (ncells_expand,)
-
-        sum_s = 0.0 # shape:(norbs, norbs)
-        # sum_r = 0.0 # shape:(norbs, norbs, natoms)
-        
-        S_cell = self.graph_data.S_cell
-        
-        for m in range(len(self.graph_data.cell_shift_array)): # ncells
-            for i, n in enumerate(self.n_list_1[m]): # ncells
-                relative_cell_mn = self.relative_cell_mn_list_1[m][i]
-                sum_s += phase1[m]*phase2[n]*S_cell[relative_cell_mn]
-        
-        for m in range(len(self.cell_shift_array_expand)): # ncells_expand
-            for i, n in enumerate(self.n_list_2[m]): # ncells_expand
-                relative_cell_mn = self.relative_cell_mn_list_2[m][i]
-                sum_s += phase1_expand[m]*phase2_expand[n]*S_cell[relative_cell_mn]
-
-        for m in range(len(self.graph_data.cell_shift_array)): # ncells
-            for i, n in enumerate(self.n_list_3[m]): # ncells_expand
-                relative_cell_mn = self.relative_cell_mn_list_3[m][i]
-                sum_s += phase1[m]*phase2_expand[n]*S_cell[relative_cell_mn]
-
-        for m in range(len(self.cell_shift_array_expand)): # ncells_expand
-            for i, n in enumerate(self.n_list_4[m]): # ncells
-                relative_cell_mn = self.relative_cell_mn_list_4[m][i]
-                sum_s += phase1_expand[m]*phase2[n]*S_cell[relative_cell_mn]
-        
-        # g->ng, i,j->(x,y,z), k->natoms, m/n -> norbs
-        # for m, Cm in enumerate(self.graph_data.cell_shift_array): # ncells
-        #     for n, Cn in enumerate(self.graph_data.cell_shift_array): # ncells
-        #         relative_cell_shift = tuple((Cn - Cm).tolist())
-        #         if relative_cell_shift in self.cell_index_map:
-        #             relative_cell_mn = self.cell_index_map[relative_cell_shift] 
-        #             # tmp = np.expand_dims(self.graph_data.P_cell[relative_cell_mn], axis=0) - self.graph_data.S_cell[relative_cell_mn][None,:,:,None]*tao_k[:,None,None,:] # (natoms, norbs, norbs, 3)
-        #             # sum_r += phase1[m]*phase2[n]*2j*np.pi*np.einsum('gi, kmni -> kgmn', q_vec[None,:]+G_vec, tmp)
-        #             sum_s += phase1[m]*phase2[n]*self.graph_data.S_cell[relative_cell_mn]
-                    
-        # for m, Cm in enumerate(cell_shift_array_expand): # ncells_expand
-        #     for n, Cn in enumerate(cell_shift_array_expand): # ncells_expand
-        #         relative_cell_shift = tuple((Cn - Cm).tolist())
-        #         if relative_cell_shift in self.cell_index_map:
-        #             relative_cell_mn = self.cell_index_map[relative_cell_shift]
-        #             # tmp = np.expand_dims(self.graph_data.P_cell[relative_cell_mn], axis=0) - self.graph_data.S_cell[relative_cell_mn][None,:,:,None]*tao_k[:,None,None,:] # (natoms, norbs, norbs, 3)
-        #             # sum_r += phase1_expand[m]*phase2_expand[n]*2j*np.pi*np.einsum('gi, kmni -> kgmn', q_vec[None,:]+G_vec, tmp)
-        #             sum_s += phase1_expand[m]*phase2_expand[n]*self.graph_data.S_cell[relative_cell_mn]
-
-        # for m, Cm in enumerate(self.graph_data.cell_shift_array): # ncells
-        #     for n, Cn in enumerate(cell_shift_array_expand): # ncells_expand
-        #         relative_cell_shift = tuple((Cn - Cm).tolist())
-        #         if relative_cell_shift in self.cell_index_map:
-        #             relative_cell_mn = self.cell_index_map[relative_cell_shift]
-        #             # tmp = np.expand_dims(self.graph_data.P_cell[relative_cell_mn], axis=0) - self.graph_data.S_cell[relative_cell_mn][None,:,:,None]*tao_k[:,None,None,:] # (natoms, norbs, norbs, 3)
-        #             # sum_r += phase1[m]*phase2_expand[n]*2j*np.pi*np.einsum('gi, kmni -> kgmn', q_vec[None,:]+G_vec, tmp)
-        #             sum_s += phase1[m]*phase2_expand[n]*self.graph_data.S_cell[relative_cell_mn]
-                    
-        # for m, Cm in enumerate(cell_shift_array_expand): # ncells_expand
-        #     for n, Cn in enumerate(self.graph_data.cell_shift_array): # ncells
-        #         relative_cell_shift = tuple((Cn - Cm).tolist())
-        #         if relative_cell_shift in self.cell_index_map:
-        #             relative_cell_mn = self.cell_index_map[relative_cell_shift]
-        #             # tmp = np.expand_dims(self.graph_data.P_cell[relative_cell_mn], axis=0) - self.graph_data.S_cell[relative_cell_mn][None,:,:,None]*tao_k[:,None,None,:] # (natoms, norbs, norbs, 3)
-        #             # sum_r += phase1_expand[m]*phase2[n]*2j*np.pi*np.einsum('gi, kmni -> kgmn', q_vec[None,:]+G_vec, tmp)
-        #             sum_s += phase1_expand[m]*phase2[n]*self.graph_data.S_cell[relative_cell_mn]
-    
-        # inner_product = np.einsum('mn, kgmn->kg', wave_coe_tp, sum_r+sum_s[None,None,:,:])/ncells_expand # shape: (natoms, ng)
-        inner_product = np.einsum('mn, mn', wave_coe_tp, sum_s) / self.ncells_expand
-        
-        temp1 = Hamcts.TWOPI*np.einsum('gi,kij,kj -> kg', q_vec[None,:]+G_vec, self.BECs, phon_vec) # shape: (natoms, ng)
-        temp2 = Hamcts.TWOPI_SQUARE*np.einsum('gi,ij,gj -> g', q_vec[None,:]+G_vec, self.DL, q_vec[None,:]+G_vec) # shape: (ng,)
-        temp3 = temp1/temp2[None,:] # shape: (natoms, ng)
-        
-        temp4 = (temp3*inner_product).sum(-1) # shape: (natoms,)
-        temp5 = np.sqrt(1/(2.0*atomic_mass*freq)) # shape: (natoms,)
-        
-        ret = Hamcts.JFOURPI * (temp4 * temp5).sum() / self.volume_uc
-        
+        if self.LRC_taylor_order == 0:
+            # qG_vec_cart in bohr^{-1}
+            qG_vec_cart, exp_inner_term = self._get_LRC_ewald_G(q_vec)
+            phase = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.nbr_shift_of_cell*k_vec[None,:], axis=-1)) # shape: (ncells, )
+            sum_r = np.einsum('n, ij, nij->', phase, wave_coe_tp, self.graph_data.S_cell)
+            atomic_phase = np.exp(-1.0j*np.einsum('ga, ka->kg', qG_vec_cart, self.graph_data.pos))  # shape: (natoms, ngs)
+            temp1 = np.einsum('gi, kij, kj->kg', qG_vec_cart, self.BECs, phon_vec) # shape: (natoms, ngs)
+            temp2 = np.exp(-exp_inner_term / self.ewald_param) / exp_inner_term
+            temp3 = temp1 * temp2[None,:] * atomic_phase # shape: (natoms, ngs)
+            ret = Hamcts.JFOURPI * np.einsum('kg, k->', temp3, ph_prefac) * sum_r / self.volume_uc
+        elif self.LRC_taylor_order == 1:
+            # qG_vec_cart in bohr^{-1}
+            qG_vec_cart, exp_inner_term = self._get_LRC_ewald_G(q_vec)
+            phase = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.nbr_shift_of_cell*k_vec[None,:], axis=-1)) # shape: (ncells, )
+            mat_r = 1.0j*np.einsum('nija, ga->gnij', self.graph_data.P_cell, qG_vec_cart)   # shape: (ngs, ncells, norbs, norbs)
+            # mat_exp: shape (ngs, ncells, norbs, norbs)
+            mat_exp_taylor = self.graph_data.S_cell[None, :, :] + mat_r
+            sum_r = np.einsum('n, ij, gnij->g', phase, wave_coe_tp, mat_exp_taylor) # shape: (ngs, )
+            atomic_phase = np.exp(-1.0j*np.einsum('ga, ka->kg', qG_vec_cart, self.graph_data.pos))  # shape: (natoms, ngs)
+            temp1 = np.einsum('gi, kij, kj->kg', qG_vec_cart, self.BECs, phon_vec) # shape: (natoms, ngs)
+            temp2 = np.exp(-exp_inner_term / self.ewald_param) / exp_inner_term
+            temp3 = temp1 * temp2[None,:] * atomic_phase # shape: (natoms, ngs)
+            temp4 = (temp3*sum_r[None,:]).sum(-1) # shape: (natoms, )
+            ret = Hamcts.JFOURPI * (temp4 * ph_prefac).sum() / self.volume_uc
         return ret
+
+    def _get_LRC_ewald_G(self, q_vec_cart:np.ndarray):
+        # move q_vec to 1BZ
+        q_vec = self._car2frac(q_vec_cart)
+        q_vec = q_vec - np.floor(q_vec)
+        # Transform q_vec to cartesian coordinates
+        q_vec_cart = self._frac2car(q_vec)[0]
+        if np.linalg.norm(q_vec_cart) < Hamcts.TENPM10:
+            G_vec_cart = self._get_reciprocal_lattice_vectors(5,5,5, True) # (ngs, 3)
+        else:
+            G_vec_cart = self._get_reciprocal_lattice_vectors(5,5,5, False) # (ngs, 3)
+        qG_vec_cart = q_vec_cart[None, :] + G_vec_cart  # (ngs, 3)
+        qG_vec_cart = qG_vec_cart * Hamcts.TWOPI
+        exp_inner_term = np.einsum('gi, ij, gj->g', qG_vec_cart, self.DL, qG_vec_cart)   # (ngs, )
+        tmp_mask = exp_inner_term < (Hamcts.EWALD_LN_CUTOFF * self.ewald_param)
+        exp_inner_term = exp_inner_term[tmp_mask]  # (ngs_in, )
+        qG_vec_cart = qG_vec_cart[tmp_mask] # (ngs_in, 3)
+        return qG_vec_cart, exp_inner_term
 
     def _get_ecbm(self, enks, icbm):
         """
@@ -1604,7 +1441,7 @@ class EPC_calculator(object):
                                     
                                     # Correction of long-range interactions
                                     if apply_correction_for_this_q and (branch_idx in longitude_branches):
-                                        epc_corr = self._dipole_correction(tmp1, k, q, abs(freq_grid[iq, branch_idx]), eigen_vec_phon[branch_idx])
+                                        epc_corr = self._dipole_correction(tmp1, k, q, factor, eigen_vec_phon[branch_idx])
                                     else:
                                         epc_corr = 0.0
                                     epc = epc + epc_corr
@@ -1734,7 +1571,7 @@ class EPC_calculator(object):
                                     
                                     # Correction of long-range interactions
                                     if apply_correction_for_this_q and branch_idx in longitude_branches:
-                                        epc_corr = self._dipole_correction(tmp1, k, q, abs(freq[branch_idx]), eigen_vec_phon[branch_idx])
+                                        epc_corr = self._dipole_correction(tmp1, k, q, factor, eigen_vec_phon[branch_idx])
                                     else:
                                         epc_corr = 0.0
                                     epc = epc + epc_corr
@@ -1849,7 +1686,7 @@ class EPC_calculator(object):
                                 
                                 # Correction of long-range interactions
                                 if apply_correction_for_this_q and (branch_idx in longitude_branches):
-                                    epc_corr = self._dipole_correction(tmp1, k, q, abs(freq[branch_idx]), eigen_vec_phon[branch_idx])
+                                    epc_corr = self._dipole_correction(tmp1, k, q, factor, eigen_vec_phon[branch_idx])
                                 else:
                                     epc_corr = 0.0
                                 epc = epc + epc_corr
@@ -1962,8 +1799,9 @@ class EPC_calculator(object):
                             for jbnd in range(nbands):
                                 tmp1 = np.einsum('m,n -> mn', np.conj(wave_kpq[jbnd]), wave_k[ibnd])
                                 for imode in range(len(longitude_branches)):
+                                    factor = 1.0 / np.sqrt(2.0 * self.atomic_mass * abs(freq[imode])) # shape:(natoms,)
                                     if match_table[ibnd, jbnd, imode]:
-                                        epc = self._dipole_correction(tmp1, k, q, abs(freq[imode]), eigen_vec_phon[imode])
+                                        epc = self._dipole_correction(tmp1, k, q, factor, eigen_vec_phon[imode])
                                         delta_f1 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] + freq[imode]) * self.inv_smearq) * self.inv_smearq
                                         delta_f2 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] - freq[imode]) * self.inv_smearq) * self.inv_smearq
                                         g2_tmp = np.abs(epc) * np.abs(epc)
@@ -2104,7 +1942,7 @@ class EPC_calculator(object):
                                             epc += np.conj(phase_kpq[m])*phase_k[n]*np.einsum('mnij,mnij', tmp2, self.grad_mat[i_m,i_n])
                                     # Correction of long-range interactions
                                     if apply_correction_for_this_q:
-                                        epc_corr = self._dipole_correction(tmp1, k, q, abs(freq[imode]), eigen_vec_phon[imode])
+                                        epc_corr = self._dipole_correction(tmp1, k, q, factor, eigen_vec_phon[imode])
                                         epc = epc + epc_corr
                                         g2_tmp = np.abs(epc) * np.abs(epc) - np.abs(epc_corr) * np.abs(epc_corr)
                                     else:

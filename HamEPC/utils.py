@@ -18,6 +18,10 @@ import sys
 ################################################## Constants ##################################################
 class Constants(object):
     def __init__(self):
+        # used constant
+        self.EWALD_LN_CUTOFF = 14.0    # exp(-14) ~ 1E-6
+        self.EWALD_SCALE = 1.0  # unit in (2PI/alat)^{2}
+
         # numbers
         self.PI = math.pi
         self.TWOPI = 2.0 * math.pi
@@ -274,6 +278,7 @@ default_parameters:dict[str, dict[str, Any]] = {
         'grad_mat_path': "./grad_mat.npy",
         'mat_info_rc_path': "./mat_info_rc.npy",
         'cell_range_cut': [2,2,2],
+        'LRC_taylor_order': 0,
     },
     'transport': {
         'k_size': [32,32,32],
