@@ -805,16 +805,42 @@ def build_sparse_matrix(species, cell_shift, nao_max, Hon, Hoff, edge_index, Ham
         H_cell = H_cell.reshape(-1, norbs, norbs)
         return (H_cell, cell_shift_array, cell_index, cell_index_map, inv_cell_index)
 
+def _phase_contract_cells(phase, M_flat):
+    """Contract the cell axis of M_flat against a complex phase matrix.
+
+    phase is complex while M_flat is real whenever SOC is off.  Handing that pair
+    straight to numpy upcasts the whole of M_flat to complex first, allocating and
+    writing a temporary the size of the matrix on every call, even though H_cell and
+    S_cell never change.  Splitting the phase into contiguous real and imaginary
+    blocks keeps the large operand real and runs two real GEMMs instead, with no
+    temporary.  The ascontiguousarray calls matter: passing the strided phase.real
+    view directly drops BLAS onto a slow path.
+
+    Args:
+        phase (np.ndarray): (nk, ncells), complex
+        M_flat (np.ndarray): (ncells, -1), real or complex
+
+    Returns:
+        np.ndarray: (nk, -1), complex
+    """
+    if np.iscomplexobj(M_flat):
+        return phase @ M_flat
+    _pr = np.ascontiguousarray(phase.real)
+    _pi = np.ascontiguousarray(phase.imag)
+
+    return (_pr @ M_flat) + 1j*(_pi @ M_flat)
+
 def build_reciprocal_from_sparseMat(H_cell, k_vec, nbr_shift_of_cell):
     """_summary_
 
     Args:
         H_cell (_type_): (ncells, norbs, norbs)
     """
-    
-    phase = np.exp(2j*np.pi*np.sum(nbr_shift_of_cell[None,:,:]*k_vec[:,None,:], axis=-1)) # shape (nk, ncells)
-    HK = np.einsum('ijk, ni->njk', H_cell, phase) # (nk, norbs, norbs,)
-    
+    ncells, norbs = H_cell.shape[0], H_cell.shape[1]
+    phase = np.exp(2j*np.pi * (k_vec @ nbr_shift_of_cell.T)) # shape (nk, ncells)
+    HK = _phase_contract_cells(phase, H_cell.reshape(ncells, -1)).reshape(
+        len(k_vec), norbs, norbs)
+
     return HK
 
 def build_reciprocal_from_sparseMat3(M_cell, k_vec, nbr_shift_of_cell):
@@ -823,10 +849,11 @@ def build_reciprocal_from_sparseMat3(M_cell, k_vec, nbr_shift_of_cell):
     Args:
         H_cell (_type_): (ncells, norbs, norbs, 3)
     """
-    
-    phase = np.exp(2j*np.pi*np.sum(nbr_shift_of_cell[None,:,:]*k_vec[:,None,:], axis=-1)) # shape (nk, ncells)
-    MK = 1.0j*np.einsum('ijkl, ni->njkl', M_cell, phase) # (nk, norbs, norbs, 3)
-    
+    ncells, norbs = M_cell.shape[0], M_cell.shape[1]
+    phase = np.exp(2j*np.pi * (k_vec @ nbr_shift_of_cell.T)) # shape (nk, ncells)
+    MK = 1.0j*_phase_contract_cells(phase, M_cell.reshape(ncells, -1)).reshape(
+        len(k_vec), norbs, norbs, 3)
+
     return MK
 
 def build_reciprocal_from_sparseMat_soc(H_cell, k_vec, nbr_shift_of_cell):
