@@ -7,6 +7,7 @@ LastEditors: Yang Zhong
 LastEditTime: 2024-05-16 23:42:25
 '''
 import os
+import time
 import yaml
 import numpy as np
 from scipy.linalg import eigh
@@ -140,16 +141,75 @@ class EPC_calculator(object):
                 self.grad_mat_split = split_array_along_2axes(grad_mat, axis1=2, axis2=3, sizes1=self.orbital_splits, sizes2=self.orbital_splits)
             else:
                 self.grad_mat_split = [[None] * self.split_orbits_num_blocks  for _ in range(self.split_orbits_num_blocks)]
-        else:       
-            if self.read_large_grad_mat:
-                original_list = list(range(self.rank_size))
-                result_list = [original_list[i:i+3] for i in range(0, len(original_list), 3)] # 每次三个进程同时读大的grad_mat文件,防止内存不够
-                for tmp_list in result_list:
-                    if self.rank in tmp_list:
-                        self.grad_mat = np.load(self.grad_mat_path)[self.cell_cut_array[:,None], self.cell_cut_array[None,:]]
-                    self.comm.Barrier()
-            else:
-                self.grad_mat = np.load(self.grad_mat_path)[self.cell_cut_array[:,None], self.cell_cut_array[None,:]]
+        else:
+            # --- MPI shared memory: load grad_mat once per node ---
+            # Every rank used to hold its own copy (or re-read it through mmap on every
+            # access), so a node running N ranks needed N copies of it.
+            # Allocating a shared-memory window instead means one copy per node, which
+            # both removes the duplicated RAM and the repeated mmap disk I/O.
+            try:
+                node_comm = self.comm.Split_type(MPI.COMM_TYPE_SHARED)
+                node_rank = node_comm.Get_rank()
+
+                # Read the header through mmap to get shape/dtype without loading data.
+                _mmap_tmp = np.load(self.grad_mat_path, mmap_mode='r')
+                _full_shape = _mmap_tmp.shape
+                _dtype = _mmap_tmp.dtype
+
+                # Work out the cell subset that is actually needed.
+                _n_all = len(self.cell_shift_array_reduced)
+                _no_cut = (len(self.cell_cut_array) == _n_all and
+                           np.all(self.cell_cut_array == np.arange(_n_all)))
+                if _no_cut:
+                    _target_shape = _full_shape
+                else:
+                    nc = len(self.cell_cut_array)
+                    _target_shape = (nc, nc) + _full_shape[2:]
+
+                _nbytes = int(np.prod(_target_shape)) * np.dtype(_dtype).itemsize
+
+                # Rank 0 of each node owns the allocation; the others map 0 bytes.
+                if node_rank == 0:
+                    win = MPI.Win.Allocate_shared(_nbytes, np.dtype(_dtype).itemsize, comm=node_comm)
+                else:
+                    win = MPI.Win.Allocate_shared(0, np.dtype(_dtype).itemsize, comm=node_comm)
+
+                # All ranks obtain a pointer to the same buffer.
+                _buf, _itemsize = win.Shared_query(0)
+                self.grad_mat = np.ndarray(_target_shape, dtype=_dtype, buffer=_buf)
+
+                # Rank 0 of each node fills the shared buffer from disk.
+                if node_rank == 0:
+                    _t_load = time.time()
+                    if _no_cut:
+                        for iA in range(_full_shape[0]):
+                            self.grad_mat[iA] = _mmap_tmp[iA]
+                    else:
+                        _cut = self.cell_cut_array
+                        for i, iA in enumerate(_cut):
+                            self.grad_mat[i] = _mmap_tmp[iA][_cut]
+                    if self.rank == 0:
+                        print("grad_mat loaded into shared memory in {:.1f}s. Shape: {}, {:.3f} GB/node".format(
+                            time.time() - _t_load, _target_shape, _nbytes / 1e9), flush=True)
+
+                del _mmap_tmp
+                node_comm.Barrier()
+                self._grad_mat_win = win  # keep a reference so the window is not collected
+
+            except Exception as e:
+                # Fall back to mmap when shared memory is unavailable.
+                if self.rank == 0:
+                    print(f"WARNING: MPI shared memory failed ({e}), falling back to mmap.", flush=True)
+                full_grad_mmap = np.load(self.grad_mat_path, mmap_mode='r')
+                _n_all = len(self.cell_shift_array_reduced)
+                if (len(self.cell_cut_array) == _n_all and
+                        np.all(self.cell_cut_array == np.arange(_n_all))):
+                    self.grad_mat = full_grad_mmap
+                else:
+                    self.grad_mat = full_grad_mmap[self.cell_cut_array[:, None],
+                                                   self.cell_cut_array[None, :], ...]
+            if self.comm is not None:
+                self.comm.Barrier()
         self.nbr_shift_of_cell_sc = np.einsum('ni, ij -> nj', self.cell_shift_array_reduced, self.graph_data.latt) # shape: (ncells, 3)
         if self.apply_correction:
             if self.LRC_taylor_order == 1:
