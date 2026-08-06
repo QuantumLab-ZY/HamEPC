@@ -531,34 +531,38 @@ class EPC_calculator(object):
         positions = struct.frac_coords
         cell = (self.graph_data.latt*Hamcts.BOHRtoANG, positions, self.graph_data.species)
         mapping, grid = spglib.get_ir_reciprocal_mesh(mesh, cell, is_shift=shift)
+        # A single np.unique call yields the irreducible ids, the multiplicity of each
+        # (the k weights) and the full-grid -> irreducible index map.  Doing this with
+        # Counter and Python loops over `mapping` becomes the dominant cost once the
+        # mesh is large.
+        if auxiliary_info:
+            ir_ids, grid2ir_idx, counts = np.unique(mapping, return_inverse=True,
+                                                    return_counts=True)
+            grid2ir_idx = np.asarray(grid2ir_idx).reshape(-1)
+        else:
+            ir_ids, counts = np.unique(mapping, return_counts=True)
+            grid2ir_idx = None
+        # `mapping` is as large as the full mesh; release it as soon as it is consumed.
+        del mapping
         # Irreducible k-points
-        ird_grids = grid[np.unique(mapping)] / np.array(mesh, dtype=float) # (nk, 3)
+        mesh_arr = np.array(mesh, dtype=float)
+        ird_grids = grid[ir_ids] / mesh_arr # (nk, 3)
         if not return_frac:
             k_vec = np.tensordot(ird_grids, self.graph_data.lat_per_inv, axes=1) # (nk, 3)
         else:
             k_vec = ird_grids
         # get k weight
-        res = Counter(mapping) # this is a dict
-        weight = []
-        for i in np.unique(mapping):
-            weight.append(res[i])
-        weight = np.array(weight)
-        weight = weight/np.sum(weight)
+        weight = counts / np.sum(counts)
         if auxiliary_info:
-            ir_ids = np.unique(mapping)
-            ir_idx_dict = {}
-            for i, id in enumerate(ir_ids):
-                ir_idx_dict[id] = i
-            grid2ir_idx = []
-            for ir_gp_id in mapping:
-                grid2ir_idx.append(ir_idx_dict[ir_gp_id])
-            grid2ir_idx = np.array(grid2ir_idx)
-            
-            grid = grid / np.array(mesh, dtype=float)
-            if not return_frac:
-                grid = np.tensordot(grid, self.graph_data.lat_per_inv, axes=1) # (nk, 3)
+            # `grid` is returned as the raw integer mesh (int32, one third the size of a
+            # float64 copy).  Converting the whole mesh here would need two extra float64
+            # arrays of shape (prod(mesh), 3) on every rank independently.  The caller only
+            # ever uses its own slice, so it divides by `mesh` and rotates that slice
+            # instead (see mobility_cal).
             return k_vec, weight, grid, grid2ir_idx
         else:
+            # grid is only needed for the irreducible subset, which was already taken above.
+            del grid
             return k_vec, weight
 
     def _phonon_cal(self, q_grid):
@@ -1996,9 +2000,25 @@ class EPC_calculator(object):
             band_edge_index = self.CBM_band_index
         iband_edge = np.where(np.array(self.bands_indices)==band_edge_index)[0][0]
         
-        enks, _ = self._elec_cal(k_grid) # (nbandtots, nk)
-        enks = enks[self.bands_indices, :] # (nbnd, nk)
-        
+        # The band energies on the irreducible k grid are needed by every rank, but the
+        # diagonalisation is embarrassingly parallel: split the k points, diagonalise the
+        # local chunk and allgather the (small) eigenvalue array.
+        if self.comm is not None and self.rank_size > 1:
+            nk = len(k_grid)
+            counts = [nk // self.rank_size + (1 if i < nk % self.rank_size else 0)
+                      for i in range(self.rank_size)]
+            offsets = [sum(counts[:i]) for i in range(self.rank_size)]
+            k_grid_local = k_grid[offsets[self.rank]:offsets[self.rank] + counts[self.rank]]
+            if len(k_grid_local) > 0:
+                enks_local, _ = self._elec_cal(k_grid_local)
+                enks_local = enks_local[self.bands_indices, :]
+            else:
+                enks_local = np.empty((len(self.bands_indices), 0))
+            enks = np.concatenate(self.comm.allgather(enks_local), axis=1) # (nbnd, nks)
+        else:
+            enks, _ = self._elec_cal(k_grid) # (nbandtots, nk)
+            enks = enks[self.bands_indices, :] # (nbnd, nk)
+
         # carrier_density has been multiplied by unit cell volume
         self.efermi, self.carrier_density = self._get_fermi_level_insulator(enks, iband_edge)
         if self.rank == 0:
@@ -2016,9 +2036,15 @@ class EPC_calculator(object):
         split_sections = np.cumsum(split_sections, axis=0)
         grid_all = np.split(grid_all, indices_or_sections=split_sections, axis=0)
         
-        if grid_all[self.rank].size>0:
+        # _get_ir_reciprocal_mesh hands back the raw integer mesh; scale and rotate only
+        # this rank's slice so no full-mesh float64 copy is ever materialised.
+        _grid_mine = grid_all[self.rank]
+        _n_grid_mine = len(_grid_mine)
+        if _n_grid_mine > 0:
+            _grid_mine = np.tensordot(_grid_mine / np.array(self.k_size, dtype=float),
+                                      self.graph_data.lat_per_inv, axes=1)
             # calculate the electron velocity in parallel
-            elec_velocities = self.vel_nk_cal_from_HS(self.bands_indices, grid_all[self.rank]) # (nk_split, nbands, 3)
+            elec_velocities = self.vel_nk_cal_from_HS(self.bands_indices, _grid_mine) # (nk_split, nbands, 3)
         else:
             elec_velocities = np.empty((0, len(self.bands_indices), 3))
 
@@ -2095,7 +2121,7 @@ class EPC_calculator(object):
         enks_all = np.split(enks[:, grid2ir_idx], indices_or_sections=split_sections, axis=-1)
         enks_rank = enks_all[self.rank]
         
-        if grid_all[self.rank].size>0:
+        if _n_grid_mine > 0:
             mdf = minus_dfermi(enks_rank - self.efermi, self.temperature)
             sigma_mat = oe.contract('nk, kni, knj, nk->ij', mdf, elec_velocities, elec_velocities, 1.0 / rate_rank) # shape: (3, 3)
         else:
