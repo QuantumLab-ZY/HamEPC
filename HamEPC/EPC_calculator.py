@@ -807,12 +807,8 @@ class EPC_calculator(object):
 
     # ref from PW sumkg.f90
     def _sumkg(self, enks, degauss, ngauss, ene):
-        nbnd, nks = enks.shape
-        result = 0.0
-        for ik in range(nks):
-            tmp = np.sum(wgauss((ene - enks[:,ik]) / degauss, ngauss))
-            result = result + self.weight_k[ik] * tmp
-        return result
+        # Vectorized: (nbnd, nks) broadcast replaces loop over nks
+        return np.sum(wgauss((ene - enks) / degauss, ngauss) * self.weight_k[None, :])
 
     # ref from EPW utilities.f90
     def _get_fermi_level_insulator(self, enks, iband_edge):
@@ -836,27 +832,18 @@ class EPC_calculator(object):
             evbm = self._get_evbm(enks, iband_edge)
             if self.rank == 0:
                 print("VBM = {} eV".format(evbm * Hamcts.HARTREEtoEV))
-            ks_exp = np.zeros((nbnd, nks))
-            for ibnd in range(nbnd):
-                for ik in range(nks):
-                    arg = (enks[ibnd,ik] - evbm) / self.temperature
-                    if arg < -self.maxarg:
-                        ks_exp[ibnd,ik] = 0.0
-                    else:
-                        ks_exp[ibnd,ik] = np.exp(arg)
-                    arg = (enks[ibnd,ik] - ecbm) / self.temperature
+            # Vectorized: the exponential is evaluated for the whole (nbnd, nks) array at
+            # once.  np.where evaluates both arms, but the discarded one only underflows,
+            # so the values kept are the same as those the element-wise loop produced.
+            args_hole = (enks - evbm) / self.temperature
+            ks_exp = np.where(args_hole < -self.maxarg, 0.0, np.exp(args_hole))
             eup = Hamcts.TENPM160
             elw = 1.0
             for i in range(self.fermi_maxiter):
                 ef = np.sqrt(eup) * np.sqrt(elw)
-                hole_density = 0.0
-                for ibnd in range(iband_edge+1):
-                    for ik in range(nks):
-                        if ks_exp[ibnd,ik] * ef > Hamcts.TENPP60:
-                            fnk = 0.0
-                        else:
-                            fnk = 1.0 / (ks_exp[ibnd,ik] * ef + 1.0)
-                        hole_density += (1.0 - fnk) * self.weight_k[ik]
+                _kse = ks_exp[:iband_edge+1] * ef
+                fnk = np.where(_kse > Hamcts.TENPP60, 0.0, 1.0 / (_kse + 1.0))
+                hole_density = np.sum((1.0 - fnk) * self.weight_k[None, :])
                 hole_density *= self.inv_cell
                 if np.abs(hole_density) < carrier_small_judge:
                     rel_err = -Hamcts.TENPP3
@@ -869,34 +856,23 @@ class EPC_calculator(object):
                     elw = ef
                 else:
                     eup = ef
-            for ibnd in range(iband_edge+1):
-                for ik in range(nks):
-                    fnk = fermi_weight(enks[ibnd,ik] - efermi, self.temperature)
-                    carrier_density += (1.0 - fnk) * self.weight_k[ik]
+            fnk = fermi_weight(enks[:iband_edge+1] - efermi, self.temperature)
+            carrier_density += np.sum((1.0 - fnk) * self.weight_k[None, :])
         else:
             ecbm = self._get_ecbm(enks, iband_edge)
             if self.rank == 0:
                 print("CBM = {} eV".format(ecbm * Hamcts.HARTREEtoEV))
-            ks_expcb = np.zeros((nbnd, nks))
-            for ibnd in range(nbnd):
-                for ik in range(nks):
-                    arg = (enks[ibnd,ik] - ecbm) / self.temperature
-                    if arg > self.maxarg:
-                        ks_expcb[ibnd,ik] = Hamcts.TENPP200
-                    else:
-                        ks_expcb[ibnd,ik] = np.exp(arg)
+            # Vectorized, as in the hole branch above.
+            args_elec = (enks - ecbm) / self.temperature
+            ks_expcb = np.where(args_elec > self.maxarg, Hamcts.TENPP200,
+                                np.exp(np.minimum(args_elec, self.maxarg)))
             eup = 1.0
             elw = Hamcts.TENPP80
             for i in range(self.fermi_maxiter):
                 ef = np.sqrt(eup) * np.sqrt(elw)
-                electron_density = 0.0
-                for ibnd in range(iband_edge, nbnd):
-                    for ik in range(nks):
-                        if ks_expcb[ibnd,ik] * ef > Hamcts.TENPP60:
-                            fnk = 0.0
-                        else:
-                            fnk = 1.0 / (ks_expcb[ibnd,ik] * ef + 1.0)
-                        electron_density += fnk * self.weight_k[ik]
+                _kse = ks_expcb[iband_edge:] * ef
+                fnk = np.where(_kse > Hamcts.TENPP60, 0.0, 1.0 / (_kse + 1.0))
+                electron_density = np.sum(fnk * self.weight_k[None, :])
                 electron_density *= self.inv_cell
                 if np.abs(electron_density) < carrier_small_judge:
                     rel_err = Hamcts.TENPP3
@@ -909,10 +885,8 @@ class EPC_calculator(object):
                     eup = ef
                 else:
                     elw = ef
-            for ibnd in range(iband_edge, nbnd):
-                for ik in range(nks):
-                    fnk = fermi_weight(enks[ibnd,ik] - efermi, self.temperature)
-                    carrier_density += fnk * self.weight_k[ik]
+            fnk = fermi_weight(enks[iband_edge:] - efermi, self.temperature)
+            carrier_density += np.sum(fnk * self.weight_k[None, :])
         if i == (self.fermi_maxiter - 1):
             raise RuntimeError("The insulator fermi level cannot converge.", '6002')
         return efermi, carrier_density
@@ -942,12 +916,9 @@ class EPC_calculator(object):
         return ef
 
     def _get_ef_dos(self, enks):
-        dos = 0.0
-        for _, ekks in enumerate(enks):
-            for ik, enk in enumerate(ekks):
-                delta_f3 = w0gauss((enk - self.efermi) * self.inv_smeark, ngauss=1) * self.inv_smeark
-                dos = dos + delta_f3 * self.weight_k[ik]
-        return dos
+        # Vectorized: broadcast over (nbnd, nks) replaces nested loops
+        delta_f3 = w0gauss((enks - self.efermi) * self.inv_smeark, ngauss=1) * self.inv_smeark
+        return np.sum(delta_f3 * self.weight_k[None, :])
 
     def eliashberg_spectrum_cal(self):
         """

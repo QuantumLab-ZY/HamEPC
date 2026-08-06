@@ -641,22 +641,21 @@ def random_cauchy(nvec:int, cauchy_scale:float=0.05, random_seed:int=0):
         weights (np.ndarray): The weights corresponding to the vecs. # shape: (nvec, )
     """
     
-    vecs = np.zeros((nvec, 3))
-    weights = np.zeros(nvec)
-
     # set seed
     np.random.seed(random_seed)
     pa = 0.5 + np.arctan(-0.5 / cauchy_scale) / np.pi
     pb = 0.5 + np.arctan(0.5 / cauchy_scale) / np.pi
     wtmp = 1.0 / nvec
-    for i in range(nvec):
-        temp = np.random.rand(3)
-        temp = pa + temp * (pb - pa)
-        vecs[i, :] = cauchy_scale * np.tan((temp - 0.5) * np.pi)
-        temp = ((vecs[i, :] / cauchy_scale) ** 2 + 1.0) * cauchy_scale * np.pi * (pb - pa)
-        weights[i] = wtmp
-        for j in range(3):
-            weights[i] = weights[i] * temp[j]
+    # Drawn in one call rather than nvec calls of np.random.rand(3): the stream is
+    # consumed in the same order, so the vectors are bit-identical to the loop.  The
+    # weights are accumulated one component at a time for the same reason -- np.prod
+    # would multiply in a different order and round differently.
+    temp = pa + np.random.rand(nvec, 3) * (pb - pa)
+    vecs = cauchy_scale * np.tan((temp - 0.5) * np.pi)
+    temp = ((vecs / cauchy_scale) ** 2 + 1.0) * cauchy_scale * np.pi * (pb - pa)
+    weights = np.full(nvec, wtmp)
+    for j in range(3):
+        weights = weights * temp[:, j]
 
     return vecs, weights
 
