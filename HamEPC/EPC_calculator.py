@@ -1651,7 +1651,7 @@ class EPC_calculator(object):
         my_active_indices = active_k_indices[_k_lo:_k_hi]
 
         if self.rank == 0:
-            logger = time_logger(total_cycles=100, routine_name='rate_cal')
+            logger = time_logger(total_cycles=100, routine_name='rate_cal', line_per_step=True)
         # Progress is reported against the (k, q) pairs this rank owns, so it advances
         # evenly no matter whether the k or the q dimension dominates.
         _work_total = max(len(my_active_indices) * max(nqs_group, 1), 1)
@@ -2226,7 +2226,7 @@ class EPC_calculator(object):
         # Report progress in 1% steps: the loop runs over q points, whose number can be
         # very large, so one line per iteration would flood the log.
         if self.rank == 0:
-            logger = time_logger(total_cycles=100, routine_name='rate_cal_polar')
+            logger = time_logger(total_cycles=100, routine_name='rate_cal_polar', line_per_step=True)
         # Progress is reported against the (k, q) pairs this rank owns, so it advances
         # evenly no matter whether the k or the q dimension dominates.
         _work_total = max(len(q_active) * len(my_active_indices), 1)
@@ -2505,7 +2505,7 @@ class EPC_calculator(object):
         my_active_indices = active_k_indices[_k_lo:_k_hi]
 
         if self.rank == 0:
-            logger = time_logger(total_cycles=100, routine_name='rate_cal_rmp')
+            logger = time_logger(total_cycles=100, routine_name='rate_cal_rmp', line_per_step=True)
         # Progress is reported against the (k, q) pairs this rank owns, so it advances
         # evenly no matter whether the k or the q dimension dominates.
         _work_total = max(len(my_active_indices) * max(nqs_group, 1), 1)

@@ -94,7 +94,11 @@ Hamcts = Constants()
 
 ################################################## Time Logger ##################################################
 class time_logger(object):
-    def __init__(self, total_cycles, routine_name):
+    def __init__(self, total_cycles, routine_name, line_per_step=False):
+        # A carriage return erases nothing once the output is redirected to a file, so every
+        # update piles onto the same physical line.  Callers that report a bounded number of
+        # steps ask for one line each instead, which stays readable in a batch log.
+        self.line_per_step = line_per_step
         self.scale = 50
         self.total_cycles = total_cycles
         self.start = time.perf_counter()
@@ -106,13 +110,17 @@ class time_logger(object):
             print(f"Running {self.routine_name}".center(100,"-"))
         i = int(current_cycle/self.total_cycles*self.scale)
         a = "*" * i
-        b = "." * (self.scale - i)        
+        b = "." * (self.scale - i)
         c = (current_cycle / self.total_cycles) * 100
         dur = time.perf_counter() - self.start
         time_cycle = time.perf_counter() - self.last_time
         self.last_time = time.perf_counter()
         remaining_time = time_cycle*(self.total_cycles-current_cycle)
-        print("\r{:^3.0f}%[{}->{}][total: {:.2f}s, step: {:.2f}s, remaining time: {:.2f}s]".format(c,a,b,dur,time_cycle,remaining_time),end = "")
+        msg = "{:^3.0f}%[{}->{}][total: {:.2f}s, step: {:.2f}s, remaining time: {:.2f}s]".format(c,a,b,dur,time_cycle,remaining_time)
+        if self.line_per_step:
+            print(msg)
+        else:
+            print("\r" + msg, end = "")
         if current_cycle == self.total_cycles:
             print("\n"+f"{self.routine_name} has run successfully!".center(100,"-"))
         sys.stdout.flush()
