@@ -301,6 +301,14 @@ default_parameters:dict[str, dict[str, Any]] = {
         'cauchy_scale': 0.035,
         'sampling_seed': 1,
         'nsamples': 1000000,
+        # 2D MPI decomposition: number of k-groups.  The active k points are split over
+        # this many groups and the q points over the remaining rank_size / n_kgroups
+        # groups, so n_kgroups * n_qgroups == rank_size.  It must divide rank_size, and
+        # should not exceed the number of active k points or the surplus groups idle.
+        # Used by the 'none' and 'rmp' branches of polar_split; 'polar' has no k split.
+        # 1 (the default) leaves the k points unsplit, i.e. the original pure q-parallel
+        # behaviour.
+        'n_kgroups': 1,
         'ncarrier': 10000000000000000,  # 10^16 cm^-3
         'ishole': False,
         'mob_level': "ERTA", # 'ERTA'
