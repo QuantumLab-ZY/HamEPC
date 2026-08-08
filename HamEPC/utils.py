@@ -304,6 +304,7 @@ default_parameters:dict[str, dict[str, Any]] = {
     'mobility': {
         'read_momentum': False,   # When calculating the carrier mobility, read_momentum should be true.
         'over_cbm': 0.2,    # eV
+        'over_vbm': 0.2,    # eV, energy window below the VBM used for hole mobility
         'MC_sampling': "none",
         'polar_split': "none",
         'cauchy_scale': 0.035,

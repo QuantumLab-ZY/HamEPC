@@ -93,6 +93,7 @@ class EPC_calculator(object):
         
     def _initial_mobility(self):
         self.over_cbm = self.over_cbm * Hamcts.EVtoHARTREE
+        self.over_vbm = self.over_vbm * Hamcts.EVtoHARTREE
         self.MC_sampling = self.MC_sampling.lower()
         if self.MC_sampling == 'cauchy':
             if self.rank == 0: print('Sampling with Cauchy distribution.')
@@ -1501,8 +1502,14 @@ class EPC_calculator(object):
         nks = len(k_grid)
         nqs = len(q_grid)
 
-        # get cbm plus over_cbm to obtain the energy range we focus on
-        efocus_max = ecbm + self.over_cbm
+        # Energy window around the band edge: above the CBM for electrons, below the VBM
+        # for holes (ecbm holds the VBM energy when ishole is set).
+        if self.ishole:
+            efocus_min = ecbm - self.over_vbm
+            efocus_max = np.inf
+        else:
+            efocus_min = -np.inf
+            efocus_max = ecbm + self.over_cbm
 
         rate_all = np.zeros((nbands, nks))
 
@@ -1712,7 +1719,7 @@ class EPC_calculator(object):
                 k = k_grid[ik_all]
                 eig_k = all_eigens[:, ik_all]
                 wave_k = active_waves[_k_lo + _i_loc]
-                skip_mask = eig_k > efocus_max
+                skip_mask = (eig_k > efocus_max) | (eig_k < efocus_min)
                 if skip_mask.all():
                     continue
                 phase_k = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*k[None,:], axis=-1)) # shape: (ncells,)
@@ -1822,8 +1829,14 @@ class EPC_calculator(object):
                             d2 = w0gauss((de[:, None] - freq[None, :]) * self.inv_smearq) * self.inv_smearq
                             bose = bose_qvs[None, :]    # (1, nmodes)
                             fermi = fermi_kpqs[:, None] # (nbands, 1)
-                            contrib = g2_mat * mt * ((bose + fermi) * d1 +
-                                                     (bose + 1.0 - fermi) * d2)
+                            if self.ishole:
+                                # For holes the roles of the emission and absorption
+                                # occupations swap.
+                                contrib = g2_mat * mt * ((bose + 1.0 - fermi) * d1 +
+                                                         (bose + fermi) * d2)
+                            else:
+                                contrib = g2_mat * mt * ((bose + fermi) * d1 +
+                                                         (bose + 1.0 - fermi) * d2)
                             rate_all[ibnd, ik_all] += weights_q_local[iq] * contrib.sum()
                     # Counted per q batch rather than per k point: a rank owns only a few
                     # active k, so a per-k update could not resolve single percent steps.
@@ -2118,8 +2131,14 @@ class EPC_calculator(object):
         nks = len(k_grid)
         nqs = len(q_grid)
 
-        # get cbm plus over_cbm to obtain the energy range we focus on
-        efocus_max = ecbm + self.over_cbm
+        # Energy window around the band edge: above the CBM for electrons, below the VBM
+        # for holes (ecbm holds the VBM energy when ishole is set).
+        if self.ishole:
+            efocus_min = ecbm - self.over_vbm
+            efocus_max = np.inf
+        else:
+            efocus_min = -np.inf
+            efocus_max = ecbm + self.over_cbm
 
         rate_all = np.zeros((nbands, nks))
 
@@ -2276,7 +2295,7 @@ class EPC_calculator(object):
                     i_loc = _k_start + _i_b
                     ik_all = my_active_indices[i_loc]
                     eig_k = all_eigens[:, ik_all]
-                    skip_mask = eig_k > efocus_max
+                    skip_mask = (eig_k > efocus_max) | (eig_k < efocus_min)
                     if skip_mask.all():
                         continue
                     eig_kpq = eig_kpq_b[:, _i_b]
@@ -2307,8 +2326,13 @@ class EPC_calculator(object):
                     delta_f2 = w0gauss((de - fw) * self.inv_smearq) * self.inv_smearq
                     bose = bose_qvs[None, None, :]
                     fermi = fermi_kpqs[None, :, None]
-                    contrib = weights_q_local[iq] * g2_all * match_table * (
-                        (bose + fermi) * delta_f1 + (bose + 1.0 - fermi) * delta_f2)
+                    if self.ishole:
+                        # For holes the roles of the emission and absorption occupations swap.
+                        contrib = weights_q_local[iq] * g2_all * match_table * (
+                            (bose + 1.0 - fermi) * delta_f1 + (bose + fermi) * delta_f2)
+                    else:
+                        contrib = weights_q_local[iq] * g2_all * match_table * (
+                            (bose + fermi) * delta_f1 + (bose + 1.0 - fermi) * delta_f2)
                     valid_ibnd = ~skip_mask
                     rate_all[valid_ibnd, ik_all] += contrib.sum(axis=(1, 2))[valid_ibnd]
             _work_done += n_my
@@ -2355,8 +2379,14 @@ class EPC_calculator(object):
         nks = len(k_grid)
         nqs = len(q_grid)
 
-        # get cbm plus over_cbm to obtain the energy range we focus on
-        efocus_max = ecbm + self.over_cbm
+        # Energy window around the band edge: above the CBM for electrons, below the VBM
+        # for holes (ecbm holds the VBM energy when ishole is set).
+        if self.ishole:
+            efocus_min = ecbm - self.over_vbm
+            efocus_max = np.inf
+        else:
+            efocus_min = -np.inf
+            efocus_max = ecbm + self.over_cbm
 
         rate_all = np.zeros((nbands, nks))
 
@@ -2564,7 +2594,7 @@ class EPC_calculator(object):
                 k = k_grid[ik_all]
                 eig_k = all_eigens[:, ik_all]
                 wave_k = active_waves[_k_lo + _i_loc]
-                skip_mask = eig_k > efocus_max
+                skip_mask = (eig_k > efocus_max) | (eig_k < efocus_min)
                 if skip_mask.all():
                     continue
                 phase_k = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*k[None,:], axis=-1)) # shape: (ncells,)
@@ -2677,8 +2707,14 @@ class EPC_calculator(object):
                             d2 = w0gauss((de[:, None] - freq[None, :]) * self.inv_smearq) * self.inv_smearq
                             bose = bose_qvs[None, :]    # (1, nmodes)
                             fermi = fermi_kpqs[:, None] # (nbands, 1)
-                            contrib = g2_mat * mt * ((bose + fermi) * d1 +
-                                                     (bose + 1.0 - fermi) * d2)
+                            if self.ishole:
+                                # For holes the roles of the emission and absorption
+                                # occupations swap.
+                                contrib = g2_mat * mt * ((bose + 1.0 - fermi) * d1 +
+                                                         (bose + fermi) * d2)
+                            else:
+                                contrib = g2_mat * mt * ((bose + fermi) * d1 +
+                                                         (bose + 1.0 - fermi) * d2)
                             rate_all[ibnd, ik_all] += weights_q_local[iq] * contrib.sum()
                     # Counted per q batch rather than per k point: a rank owns only a few
                     # active k, so a per-k update could not resolve single percent steps.
