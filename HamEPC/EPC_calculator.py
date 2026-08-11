@@ -7,6 +7,7 @@ LastEditors: Yang Zhong
 LastEditTime: 2024-05-16 23:42:25
 '''
 import os
+import time
 import yaml
 import numpy as np
 from scipy.linalg import eigh
@@ -24,6 +25,10 @@ from pymatgen.symmetry.kpath import KPathSeek
 from pymatgen.core.periodic_table import Element
 from mpi4py import MPI
 from numpy_extension import eliashberg_spectrum_cal_helper_sparse
+
+# Upper bound on the H(k)/S(k) arrays a single batched diagonalisation may allocate.
+# The batch sizes below are derived from it so that memory stays flat in norbs.
+_BATCH_BYTES = 256 * 1024 * 1024
 
 class EPC_calculator(object):
 
@@ -88,6 +93,7 @@ class EPC_calculator(object):
         
     def _initial_mobility(self):
         self.over_cbm = self.over_cbm * Hamcts.EVtoHARTREE
+        self.over_vbm = self.over_vbm * Hamcts.EVtoHARTREE
         self.MC_sampling = self.MC_sampling.lower()
         if self.MC_sampling == 'cauchy':
             if self.rank == 0: print('Sampling with Cauchy distribution.')
@@ -140,22 +146,97 @@ class EPC_calculator(object):
                 self.grad_mat_split = split_array_along_2axes(grad_mat, axis1=2, axis2=3, sizes1=self.orbital_splits, sizes2=self.orbital_splits)
             else:
                 self.grad_mat_split = [[None] * self.split_orbits_num_blocks  for _ in range(self.split_orbits_num_blocks)]
-        else:       
-            if self.read_large_grad_mat:
-                original_list = list(range(self.rank_size))
-                result_list = [original_list[i:i+3] for i in range(0, len(original_list), 3)] # 每次三个进程同时读大的grad_mat文件,防止内存不够
-                for tmp_list in result_list:
-                    if self.rank in tmp_list:
-                        self.grad_mat = np.load(self.grad_mat_path)[self.cell_cut_array[:,None], self.cell_cut_array[None,:]]
-                    self.comm.Barrier()
-            else:
-                self.grad_mat = np.load(self.grad_mat_path)[self.cell_cut_array[:,None], self.cell_cut_array[None,:]]
+        else:
+            # --- MPI shared memory: load grad_mat once per node ---
+            # Every rank used to hold its own copy (or re-read it through mmap on every
+            # access), so a node running N ranks needed N copies of it.
+            # Allocating a shared-memory window instead means one copy per node, which
+            # both removes the duplicated RAM and the repeated mmap disk I/O.
+            try:
+                node_comm = self.comm.Split_type(MPI.COMM_TYPE_SHARED)
+                node_rank = node_comm.Get_rank()
+
+                # Read the header through mmap to get shape/dtype without loading data.
+                _mmap_tmp = np.load(self.grad_mat_path, mmap_mode='r')
+                _full_shape = _mmap_tmp.shape
+                _dtype = _mmap_tmp.dtype
+
+                # Work out the cell subset that is actually needed.
+                _n_all = len(self.cell_shift_array_reduced)
+                _no_cut = (len(self.cell_cut_array) == _n_all and
+                           np.all(self.cell_cut_array == np.arange(_n_all)))
+                if _no_cut:
+                    _target_shape = _full_shape
+                else:
+                    nc = len(self.cell_cut_array)
+                    _target_shape = (nc, nc) + _full_shape[2:]
+
+                _nbytes = int(np.prod(_target_shape)) * np.dtype(_dtype).itemsize
+
+                # Rank 0 of each node owns the allocation; the others map 0 bytes.
+                if node_rank == 0:
+                    win = MPI.Win.Allocate_shared(_nbytes, np.dtype(_dtype).itemsize, comm=node_comm)
+                else:
+                    win = MPI.Win.Allocate_shared(0, np.dtype(_dtype).itemsize, comm=node_comm)
+
+                # All ranks obtain a pointer to the same buffer.
+                _buf, _itemsize = win.Shared_query(0)
+                self.grad_mat = np.ndarray(_target_shape, dtype=_dtype, buffer=_buf)
+
+                # Rank 0 of each node fills the shared buffer from disk.
+                if node_rank == 0:
+                    _t_load = time.time()
+                    if _no_cut:
+                        for iA in range(_full_shape[0]):
+                            self.grad_mat[iA] = _mmap_tmp[iA]
+                    else:
+                        _cut = self.cell_cut_array
+                        for i, iA in enumerate(_cut):
+                            self.grad_mat[i] = _mmap_tmp[iA][_cut]
+                    if self.rank == 0:
+                        print("grad_mat loaded into shared memory in {:.1f}s. Shape: {}, {:.3f} GB/node".format(
+                            time.time() - _t_load, _target_shape, _nbytes / 1e9), flush=True)
+
+                del _mmap_tmp
+                node_comm.Barrier()
+                self._grad_mat_win = win  # keep a reference so the window is not collected
+
+            except Exception as e:
+                # Fall back to mmap when shared memory is unavailable.
+                if self.rank == 0:
+                    print(f"WARNING: MPI shared memory failed ({e}), falling back to mmap.", flush=True)
+                full_grad_mmap = np.load(self.grad_mat_path, mmap_mode='r')
+                _n_all = len(self.cell_shift_array_reduced)
+                if (len(self.cell_cut_array) == _n_all and
+                        np.all(self.cell_cut_array == np.arange(_n_all))):
+                    self.grad_mat = full_grad_mmap
+                else:
+                    self.grad_mat = full_grad_mmap[self.cell_cut_array[:, None],
+                                                   self.cell_cut_array[None, :], ...]
+            if self.comm is not None:
+                self.comm.Barrier()
         self.nbr_shift_of_cell_sc = np.einsum('ni, ij -> nj', self.cell_shift_array_reduced, self.graph_data.latt) # shape: (ncells, 3)
         if self.apply_correction:
+            # Rests on the factorisation
+            #     g_long(k, q, n->m, nu) = A_nu(q) * <psi_{m,k+q}|psi_{n,k}>
+            # valid at LRC_taylor_order == 0 only, where the Ewald G sum holds no
+            # electronic quantity and the overlap no G.  First order adds i(q+G).P(k),
+            # which makes the electronic factor G-dependent and invalidates both caches;
+            # it falls back to _dipole_correction_mat.
+            self._lrc_cacheable = (self.LRC_taylor_order == 0)
             if self.LRC_taylor_order == 1:
+                # The position-operator matrix elements are optional in the graph data; say so
+                # instead of failing with an AttributeError inside _P_cell_prepare.
+                if not (hasattr(self.graph_data, 'Pon') and hasattr(self.graph_data, 'Poff')):
+                    raise RuntimeError(
+                        "LRC_taylor_order == 1 needs the position-operator matrix elements "
+                        "Pon and Poff in the graph data, and they are not present.  Set "
+                        "LRC_taylor_order to 0, or regenerate the graph data with them.")
                 self.graph_data.P_cell = self._P_cell_prepare()
             # 4 * alpha
             self.ewald_param = 4.0 * Hamcts.EWALD_SCALE * np.power(Hamcts.TWOPI / np.linalg.norm(self.graph_data.latt[0]), 2)
+        else:
+            self._lrc_cacheable = True
         
     def _initial_basic(self):
         if not (os.path.isfile(self.graph_data_path_uc) and os.access(self.graph_data_path_uc, os.R_OK)):
@@ -471,34 +552,38 @@ class EPC_calculator(object):
         positions = struct.frac_coords
         cell = (self.graph_data.latt*Hamcts.BOHRtoANG, positions, self.graph_data.species)
         mapping, grid = spglib.get_ir_reciprocal_mesh(mesh, cell, is_shift=shift)
+        # A single np.unique call yields the irreducible ids, the multiplicity of each
+        # (the k weights) and the full-grid -> irreducible index map.  Doing this with
+        # Counter and Python loops over `mapping` becomes the dominant cost once the
+        # mesh is large.
+        if auxiliary_info:
+            ir_ids, grid2ir_idx, counts = np.unique(mapping, return_inverse=True,
+                                                    return_counts=True)
+            grid2ir_idx = np.asarray(grid2ir_idx).reshape(-1)
+        else:
+            ir_ids, counts = np.unique(mapping, return_counts=True)
+            grid2ir_idx = None
+        # `mapping` is as large as the full mesh; release it as soon as it is consumed.
+        del mapping
         # Irreducible k-points
-        ird_grids = grid[np.unique(mapping)] / np.array(mesh, dtype=float) # (nk, 3)
+        mesh_arr = np.array(mesh, dtype=float)
+        ird_grids = grid[ir_ids] / mesh_arr # (nk, 3)
         if not return_frac:
             k_vec = np.tensordot(ird_grids, self.graph_data.lat_per_inv, axes=1) # (nk, 3)
         else:
             k_vec = ird_grids
         # get k weight
-        res = Counter(mapping) # this is a dict
-        weight = []
-        for i in np.unique(mapping):
-            weight.append(res[i])
-        weight = np.array(weight)
-        weight = weight/np.sum(weight)
+        weight = counts / np.sum(counts)
         if auxiliary_info:
-            ir_ids = np.unique(mapping)
-            ir_idx_dict = {}
-            for i, id in enumerate(ir_ids):
-                ir_idx_dict[id] = i
-            grid2ir_idx = []
-            for ir_gp_id in mapping:
-                grid2ir_idx.append(ir_idx_dict[ir_gp_id])
-            grid2ir_idx = np.array(grid2ir_idx)
-            
-            grid = grid / np.array(mesh, dtype=float)
-            if not return_frac:
-                grid = np.tensordot(grid, self.graph_data.lat_per_inv, axes=1) # (nk, 3)
+            # `grid` is returned as the raw integer mesh (int32, one third the size of a
+            # float64 copy).  Converting the whole mesh here would need two extra float64
+            # arrays of shape (prod(mesh), 3) on every rank independently.  The caller only
+            # ever uses its own slice, so it divides by `mesh` and rotates that slice
+            # instead (see mobility_cal).
             return k_vec, weight, grid, grid2ir_idx
         else:
+            # grid is only needed for the irreducible subset, which was already taken above.
+            del grid
             return k_vec, weight
 
     def _phonon_cal(self, q_grid):
@@ -539,15 +624,71 @@ class EPC_calculator(object):
             w, v = eigh(a=HK[ik], b=SK[ik])
             eigen.append(w)
             eigen_vecs.append(v)
-        
+
         eigen = np.swapaxes(np.array(eigen), 0, 1) # (norbs, nk)
         eigen_vecs = np.array(eigen_vecs) # (nk, norbs, norbs)
         eigen_vecs = np.swapaxes(eigen_vecs, -1, -2)
-        
+
         lamda = np.einsum('nai, nij, naj -> na', np.conj(eigen_vecs), SK, eigen_vecs).real
         lamda = 1/np.sqrt(lamda) # shape: (nk, norbs)
         eigen_vecs = eigen_vecs*lamda[:,:,None]
-        
+
+        return eigen, eigen_vecs
+
+    def _elec_cal_partial(self, k_grid, band_indices):
+        """
+        Partial eigendecomposition: compute only eigenvalues/vectors for bands
+        in the range [min(band_indices), max(band_indices)] using scipy.linalg.eigh
+        with subset_by_index (LAPACK ?hegvx).  The Cholesky factorisation and the
+        tridiagonal reduction are unavoidable, but the eigenvalues of the subset are
+        located by bisection and only their eigenvectors are back-transformed, which
+        is faster than the full spectrum when only a few bands around the band edge
+        are needed.
+
+        Args:
+            k_grid (np.ndarray): (nk, 3) k vectors.
+            band_indices (list or np.ndarray): the band indices to return.
+
+        Returns:
+            eigen      : np.ndarray, shape (len(band_indices), nk)
+            eigen_vecs : np.ndarray, shape (nk, len(band_indices), norbs)
+        """
+        k_vec = k_grid.reshape(-1, 3)
+        SK = build_reciprocal_from_sparseMat(
+            self.graph_data.S_cell, k_vec, self.graph_data.nbr_shift_of_cell)
+        if self.soc_switch:
+            HK = build_reciprocal_from_sparseMat_soc(
+                self.graph_data.H_cell, k_vec, self.graph_data.nbr_shift_of_cell)
+            I = np.identity(2, dtype=SK.dtype)
+            SK = np.kron(I, SK)
+        else:
+            HK = build_reciprocal_from_sparseMat(
+                self.graph_data.H_cell, k_vec, self.graph_data.nbr_shift_of_cell)
+
+        i_lo = int(min(band_indices))
+        i_hi = int(max(band_indices))
+        # positions of band_indices within the returned subset [i_lo .. i_hi]
+        local_pos = [int(b) - i_lo for b in band_indices]
+
+        eigen_list = []
+        eigen_vecs_list = []
+        for ik in range(len(k_vec)):
+            w, v = eigh(a=HK[ik], b=SK[ik],
+                        subset_by_index=[i_lo, i_hi])
+            # w: (i_hi-i_lo+1,)   v: (norbs, i_hi-i_lo+1)
+            eigen_list.append(w[local_pos])
+            eigen_vecs_list.append(v[:, local_pos])   # (norbs, nbands)
+
+        eigen = np.swapaxes(np.array(eigen_list), 0, 1)  # (nbands, nk)
+        eigen_vecs = np.array(eigen_vecs_list)           # (nk, norbs, nbands)
+        eigen_vecs = np.swapaxes(eigen_vecs, -1, -2)     # (nk, nbands, norbs)
+
+        # Re-normalise  <psi_n | S_k | psi_n>  (same formula as _elec_cal)
+        lamda = np.einsum('nai, nij, naj -> na',
+                          np.conj(eigen_vecs), SK, eigen_vecs).real
+        lamda = 1.0 / np.sqrt(np.abs(lamda) + 1e-30)
+        eigen_vecs = eigen_vecs * lamda[:, :, None]
+
         return eigen, eigen_vecs
 
     def EPC_cal_path(self, k_fix, q_paths, band_ini, band_fin, do_symm:bool=True):
@@ -761,6 +902,41 @@ class EPC_calculator(object):
             ret = Hamcts.JFOURPI * (temp4 * ph_prefac).sum() / self.volume_uc
         return ret
 
+    def _dipole_correction_mat(self, ibnd, wave_k, wave_kpq, k_vec, q_vec, factor_all,
+                               phvec_wap, freq):
+        """
+        The dipole correction of one (k, q, ibnd) for every (jbnd, branch), as a
+        (nbands, nmodes) matrix.
+
+        This is the fallback used at LRC_taylor_order == 1, where the correction does not
+        factorise into a (q, branch)-dependent Ewald sum times an electronic overlap, so the
+        cached form used at zeroth order is invalid and every band pair and branch has to go
+        through _dipole_correction individually, as before.
+
+        Args:
+            ibnd (int): index of the initial band within band_indice.
+            wave_k (np.ndarray): (nbands, norbs) eigenvectors at k.
+            wave_kpq (np.ndarray): (nbands, norbs) eigenvectors at k+q.
+            k_vec (np.ndarray): (3,) k vector.
+            q_vec (np.ndarray): (3,) q vector.
+            factor_all (np.ndarray): (nmodes, natoms) phonon prefactors.
+            phvec_wap (np.ndarray): (nmodes, natoms, 3) phonon eigenvectors with the
+                atomic phase already applied.
+            freq (np.ndarray): (nmodes,) phonon frequencies.
+
+        Returns:
+            np.ndarray: (nbands, nmodes) complex.
+        """
+        nbands = len(wave_kpq)
+        nmodes = len(phvec_wap)
+        out = np.zeros((nbands, nmodes), dtype=np.complex128)
+        for jbnd in range(nbands):
+            tmp1 = np.einsum('m,n -> mn', np.conj(wave_kpq[jbnd]), wave_k[ibnd])
+            for imode in range(nmodes):
+                out[jbnd, imode] = self._dipole_correction(
+                    tmp1, k_vec, q_vec, factor_all[imode], phvec_wap[imode])
+        return out
+
     def _get_LRC_ewald_G(self, q_vec_cart:np.ndarray):
         # move q_vec to 1BZ
         q_vec = self._car2frac(q_vec_cart)
@@ -807,12 +983,8 @@ class EPC_calculator(object):
 
     # ref from PW sumkg.f90
     def _sumkg(self, enks, degauss, ngauss, ene):
-        nbnd, nks = enks.shape
-        result = 0.0
-        for ik in range(nks):
-            tmp = np.sum(wgauss((ene - enks[:,ik]) / degauss, ngauss))
-            result = result + self.weight_k[ik] * tmp
-        return result
+        # Vectorized: (nbnd, nks) broadcast replaces loop over nks
+        return np.sum(wgauss((ene - enks) / degauss, ngauss) * self.weight_k[None, :])
 
     # ref from EPW utilities.f90
     def _get_fermi_level_insulator(self, enks, iband_edge):
@@ -836,27 +1008,18 @@ class EPC_calculator(object):
             evbm = self._get_evbm(enks, iband_edge)
             if self.rank == 0:
                 print("VBM = {} eV".format(evbm * Hamcts.HARTREEtoEV))
-            ks_exp = np.zeros((nbnd, nks))
-            for ibnd in range(nbnd):
-                for ik in range(nks):
-                    arg = (enks[ibnd,ik] - evbm) / self.temperature
-                    if arg < -self.maxarg:
-                        ks_exp[ibnd,ik] = 0.0
-                    else:
-                        ks_exp[ibnd,ik] = np.exp(arg)
-                    arg = (enks[ibnd,ik] - ecbm) / self.temperature
+            # Vectorized: the exponential is evaluated for the whole (nbnd, nks) array at
+            # once.  np.where evaluates both arms, but the discarded one only underflows,
+            # so the values kept are the same as those the element-wise loop produced.
+            args_hole = (enks - evbm) / self.temperature
+            ks_exp = np.where(args_hole < -self.maxarg, 0.0, np.exp(args_hole))
             eup = Hamcts.TENPM160
             elw = 1.0
             for i in range(self.fermi_maxiter):
                 ef = np.sqrt(eup) * np.sqrt(elw)
-                hole_density = 0.0
-                for ibnd in range(iband_edge+1):
-                    for ik in range(nks):
-                        if ks_exp[ibnd,ik] * ef > Hamcts.TENPP60:
-                            fnk = 0.0
-                        else:
-                            fnk = 1.0 / (ks_exp[ibnd,ik] * ef + 1.0)
-                        hole_density += (1.0 - fnk) * self.weight_k[ik]
+                _kse = ks_exp[:iband_edge+1] * ef
+                fnk = np.where(_kse > Hamcts.TENPP60, 0.0, 1.0 / (_kse + 1.0))
+                hole_density = np.sum((1.0 - fnk) * self.weight_k[None, :])
                 hole_density *= self.inv_cell
                 if np.abs(hole_density) < carrier_small_judge:
                     rel_err = -Hamcts.TENPP3
@@ -869,34 +1032,23 @@ class EPC_calculator(object):
                     elw = ef
                 else:
                     eup = ef
-            for ibnd in range(iband_edge+1):
-                for ik in range(nks):
-                    fnk = fermi_weight(enks[ibnd,ik] - efermi, self.temperature)
-                    carrier_density += (1.0 - fnk) * self.weight_k[ik]
+            fnk = fermi_weight(enks[:iband_edge+1] - efermi, self.temperature)
+            carrier_density += np.sum((1.0 - fnk) * self.weight_k[None, :])
         else:
             ecbm = self._get_ecbm(enks, iband_edge)
             if self.rank == 0:
                 print("CBM = {} eV".format(ecbm * Hamcts.HARTREEtoEV))
-            ks_expcb = np.zeros((nbnd, nks))
-            for ibnd in range(nbnd):
-                for ik in range(nks):
-                    arg = (enks[ibnd,ik] - ecbm) / self.temperature
-                    if arg > self.maxarg:
-                        ks_expcb[ibnd,ik] = Hamcts.TENPP200
-                    else:
-                        ks_expcb[ibnd,ik] = np.exp(arg)
+            # Vectorized, as in the hole branch above.
+            args_elec = (enks - ecbm) / self.temperature
+            ks_expcb = np.where(args_elec > self.maxarg, Hamcts.TENPP200,
+                                np.exp(np.minimum(args_elec, self.maxarg)))
             eup = 1.0
             elw = Hamcts.TENPP80
             for i in range(self.fermi_maxiter):
                 ef = np.sqrt(eup) * np.sqrt(elw)
-                electron_density = 0.0
-                for ibnd in range(iband_edge, nbnd):
-                    for ik in range(nks):
-                        if ks_expcb[ibnd,ik] * ef > Hamcts.TENPP60:
-                            fnk = 0.0
-                        else:
-                            fnk = 1.0 / (ks_expcb[ibnd,ik] * ef + 1.0)
-                        electron_density += fnk * self.weight_k[ik]
+                _kse = ks_expcb[iband_edge:] * ef
+                fnk = np.where(_kse > Hamcts.TENPP60, 0.0, 1.0 / (_kse + 1.0))
+                electron_density = np.sum(fnk * self.weight_k[None, :])
                 electron_density *= self.inv_cell
                 if np.abs(electron_density) < carrier_small_judge:
                     rel_err = Hamcts.TENPP3
@@ -909,10 +1061,8 @@ class EPC_calculator(object):
                     eup = ef
                 else:
                     elw = ef
-            for ibnd in range(iband_edge, nbnd):
-                for ik in range(nks):
-                    fnk = fermi_weight(enks[ibnd,ik] - efermi, self.temperature)
-                    carrier_density += fnk * self.weight_k[ik]
+            fnk = fermi_weight(enks[iband_edge:] - efermi, self.temperature)
+            carrier_density += np.sum(fnk * self.weight_k[None, :])
         if i == (self.fermi_maxiter - 1):
             raise RuntimeError("The insulator fermi level cannot converge.", '6002')
         return efermi, carrier_density
@@ -942,12 +1092,9 @@ class EPC_calculator(object):
         return ef
 
     def _get_ef_dos(self, enks):
-        dos = 0.0
-        for _, ekks in enumerate(enks):
-            for ik, enk in enumerate(ekks):
-                delta_f3 = w0gauss((enk - self.efermi) * self.inv_smeark, ngauss=1) * self.inv_smeark
-                dos = dos + delta_f3 * self.weight_k[ik]
-        return dos
+        # Vectorized: broadcast over (nbnd, nks) replaces nested loops
+        delta_f3 = w0gauss((enks - self.efermi) * self.inv_smeark, ngauss=1) * self.inv_smeark
+        return np.sum(delta_f3 * self.weight_k[None, :])
 
     def eliashberg_spectrum_cal(self):
         """
@@ -1350,115 +1497,372 @@ class EPC_calculator(object):
         """
 
         nmodes = int(3) * self.natoms
+        ncells = len(self.cell_shift_array_reduced)
         nbands = len(band_indice)
         nks = len(k_grid)
         nqs = len(q_grid)
 
-        # get cbm plus over_cbm to obtain the energy range we focus on
-        efocus_max = ecbm + self.over_cbm
+        # Energy window around the band edge: above the CBM for electrons, below the VBM
+        # for holes (ecbm holds the VBM energy when ishole is set).
+        if self.ishole:
+            efocus_min = ecbm - self.over_vbm
+            efocus_max = np.inf
+        else:
+            efocus_min = -np.inf
+            efocus_max = ecbm + self.over_cbm
 
         rate_all = np.zeros((nbands, nks))
 
-        # q points are parallelized and q grid is split
-        split_sections = np.zeros(self.rank_size, dtype=int)
+        # ------------------------------------------------------------------
+        # Ranks are arranged as n_kgroups k-groups x rank_size / n_kgroups q-groups.  The
+        # per-k quantities built below are paid once per k point, so splitting k as well as
+        # q divides that part of the work by n_kgroups.  n_kgroups = 1 (the default) leaves
+        # the k points unsplit, i.e. the original pure q-parallel layout.
+        # ------------------------------------------------------------------
+        nk_groups = int(getattr(self, 'n_kgroups', 1))
+        if nk_groups < 1 or nk_groups > self.rank_size or (self.rank_size % nk_groups) != 0:
+            if self.rank == 0 and nk_groups != 1:
+                print('  WARNING: n_kgroups={} does not divide rank_size={}; '
+                      'falling back to 1 (pure q-parallel).'.format(nk_groups, self.rank_size), flush=True)
+            nk_groups = 1
+        nq_groups = self.rank_size // nk_groups
+        # Ranks of one k-group are consecutive, so the row collectives below stay on-node.
+        k_group_id = self.rank // nq_groups
+        q_group_id = self.rank % nq_groups
+        comm_k = self.comm.Split(color=q_group_id, key=k_group_id)      # same q, different k
+        k_row_comm = self.comm.Split(color=k_group_id, key=q_group_id)  # same k, different q
+
+        # q points are distributed over the q-groups; all ranks of a group share them.
+        _q_split = np.zeros(nq_groups, dtype=int)
         for i in range(nqs):
-            split_sections[i%self.rank_size] += 1
-        split_sections = np.cumsum(split_sections, axis=0)
-        q_grid = np.split(q_grid, indices_or_sections=split_sections, axis=0)
-        weights_q = np.split(self.weight_q, indices_or_sections=split_sections, axis=0)
+            _q_split[i % nq_groups] += 1
+        _q_cumsum = np.cumsum(_q_split)
+        _q_start = int(_q_cumsum[q_group_id] - _q_split[q_group_id])
+        _q_end = int(_q_cumsum[q_group_id])
+        nqs_group = _q_end - _q_start
+        q_grid_group = q_grid[_q_start:_q_end]
+        weights_q_local = self.weight_q[_q_start:_q_end]
         self.weight_q = None
-        if q_grid[self.rank].size>0:
-            # calculate the phonon spectrum in parallel
-            freq_grid, phon_vecs = self._phonon_cal(q_grid[self.rank])
-            nqs_local = len(freq_grid)
-            phon_vecs = phon_vecs.reshape(nqs_local, nmodes, self.natoms, 3)
-            weights_q_local = weights_q[self.rank]
-            del weights_q
+
+        # Phonons for this group's q subset: the k-ranks of a q-group need the same
+        # frequencies and eigenvectors, so they take a slice each and allgather rather than
+        # every rank repeating the whole subset.
+        if self.rank == 0:
+            print('  2D decomposition: {} k-groups x {} q-groups; {} q per group'.format(
+                nk_groups, nq_groups, nqs_group), flush=True)
+        if nqs_group > 0:
+            _ph_counts = np.zeros(nk_groups, dtype=int)
+            for i in range(nqs_group):
+                _ph_counts[i % nk_groups] += 1
+            _ph_cum = np.cumsum(_ph_counts)
+            _ph_lo = int(_ph_cum[k_group_id] - _ph_counts[k_group_id])
+            _ph_hi = int(_ph_cum[k_group_id])
+            if _ph_hi > _ph_lo:
+                freq_local, phon_local = self._phonon_cal(q_grid_group[_ph_lo:_ph_hi])
+                phon_local = phon_local.reshape(-1, nmodes, self.natoms, 3)
+            else:
+                freq_local = np.empty((0, nmodes))
+                phon_local = np.empty((0, nmodes, self.natoms, 3))
+            freq_grid = np.concatenate(comm_k.allgather(freq_local), axis=0)
+            phon_vecs = np.concatenate(comm_k.allgather(phon_local), axis=0)
             # change fractional coordinates to cartesian coordinates
-            q_grid[self.rank] = self._frac2car(q_grid[self.rank])
+            q_grid_group = self._frac2car(q_grid_group)
         else:
-            q_grid[self.rank] = np.empty((0, 3))
-        
-        # k grid is split
-        if self.rank == 0:
-            print('k grid parallel is also switched on!')
-        split_sections = np.zeros(self.rank_size, dtype=int)
+            freq_grid = np.empty((0, nmodes))
+            phon_vecs = np.empty((0, nmodes, self.natoms, 3))
+            q_grid_group = np.empty((0, 3))
+
+        # Only the band energies are needed globally: every rank must agree on which k
+        # points fall outside the energy window.  The wave functions are indexed only
+        # at the k points a rank owns, and gathering them everywhere would cost
+        # nks * nbands * norbs * 16 B per rank, so they stay local.
+        # The k grid is split over the k-ranks; within a column all q-groups need the
+        # same k data, so only q_group_id == 0 diagonalises and broadcasts along the row.
+        _k_split = np.zeros(nk_groups, dtype=int)
         for i in range(nks):
-            split_sections[i%self.rank_size] += 1
-        split_sections = np.cumsum(split_sections, axis=0)
-        k_grid_all = np.split(k_grid, indices_or_sections=split_sections, axis=0)
-        if k_grid_all[self.rank].size > 0:            
-            # eigen: (norbs, nk_local) eigen_vecs: (nk_local, norbs, norbs)
-            eigen, eigen_vecs = self._elec_cal(k_grid_all[self.rank])
-            eigen = eigen[band_indice, :]
-            eigen_vecs = eigen_vecs[:, band_indice, :]
+            _k_split[i % nk_groups] += 1
+        _k_split_cum = np.cumsum(_k_split)
+        k_start_idx = int(_k_split_cum[k_group_id] - _k_split[k_group_id])
+        k_end_idx = int(_k_split_cum[k_group_id])
+        k_grid_local = k_grid[k_start_idx:k_end_idx]
+        if nk_groups == 1:
+            # One k-group means k is not split: k_grid_local is already the whole grid and
+            # the gather below would be a no-op, but the q_group_id == 0 guard would still
+            # leave a single rank diagonalising while every other rank waits on the
+            # broadcast.  Each rank therefore diagonalises for itself, which is the
+            # redundant-but-parallel layout the pure q-parallel path expects.
+            eigen_local, eigen_vecs_local = self._elec_cal_partial(k_grid_local, band_indice)
+            all_eigens = np.ascontiguousarray(eigen_local, dtype=np.float64)
+            col0_comm = MPI.COMM_NULL
         else:
-            eigen, eigen_vecs = np.empty((nbands, 0)), np.empty((0, nbands, self.norbs))
+            if q_group_id == 0:
+                if k_grid_local.size > 0:
+                    eigen_local, eigen_vecs_local = self._elec_cal_partial(k_grid_local, band_indice)
+                else:
+                    eigen_local = np.empty((nbands, 0))
+                    eigen_vecs_local = np.empty((0, nbands, self.norbs), dtype=np.complex128)
+            else:
+                eigen_local, eigen_vecs_local = None, None
+
+            # The band energies are gathered globally: every rank must agree on which k points
+            # fall inside the energy window, and eig_k is needed in the main loop.  One
+            # representative per k-rank contributes and the assembled array goes back along the
+            # row; the payload is only nbands * nks * 8 B.
+            col0_color = 0 if q_group_id == 0 else MPI.UNDEFINED
+            col0_comm = self.comm.Split(color=col0_color, key=k_group_id)
+            if q_group_id == 0:
+                all_eigens = np.concatenate(
+                    col0_comm.allgather(np.ascontiguousarray(eigen_local, dtype=np.float64)), axis=1)
+            else:
+                all_eigens = None
+            all_eigens = k_row_comm.bcast(all_eigens, root=0)
+
+        # Mark the k points outside the energy window and keep only the active ones.
+        rate_all[all_eigens > efocus_max] = np.inf
+        active_k_mask = np.any(all_eigens <= efocus_max, axis=0)
+        active_k_indices = np.where(active_k_mask)[0]
+        n_active = len(active_k_indices)
+        if self.rank == 0:
+            print('  active k points: {} / {} ({:.2f}%)'.format(n_active, nks, 100.0*n_active/max(nks,1)), flush=True)
+
+        # Only the active k points enter the main loop, so replicating their wave functions
+        # is cheap and lets the *active* points be distributed below.  That matters for load
+        # balance: the energy window usually selects a clustered region, so slicing the raw
+        # mesh would leave most ranks idle.
+        _mine_in_slice = active_k_indices[(active_k_indices >= k_start_idx) & (active_k_indices < k_end_idx)]
+        if nk_groups == 1:
+            # Every rank already holds the eigenvectors of the whole grid, so the active
+            # subset is a plain slice; no gather or broadcast is involved.
+            active_waves = np.ascontiguousarray(
+                eigen_vecs_local[_mine_in_slice - k_start_idx], dtype=np.complex128)
+        else:
+            if q_group_id == 0:
+                active_waves = np.concatenate(col0_comm.allgather(np.ascontiguousarray(
+                    eigen_vecs_local[_mine_in_slice - k_start_idx], dtype=np.complex128)), axis=0)
+            else:
+                active_waves = None
+            active_waves = k_row_comm.bcast(active_waves, root=0)
+        if col0_comm != MPI.COMM_NULL:
+            col0_comm.Free()
+
+        # Distribute the active k points over the k-groups so every rank gets the same
+        # number of them no matter how they are spread over the mesh.  active_waves is
+        # assembled in ascending k order, so active_waves[_k_lo + i] is the wave function
+        # of my_active_indices[i].
+        _k_counts = np.zeros(nk_groups, dtype=int)
+        for i in range(n_active):
+            _k_counts[i % nk_groups] += 1
+        _k_cum = np.cumsum(_k_counts)
+        _k_lo = int(_k_cum[k_group_id] - _k_counts[k_group_id])
+        _k_hi = int(_k_cum[k_group_id])
+        my_active_indices = active_k_indices[_k_lo:_k_hi]
 
         if self.rank == 0:
-            logger = time_logger(total_cycles=self.rank_size, routine_name='rate_cal')
+            logger = time_logger(total_cycles=100, routine_name='rate_cal', line_per_step=True)
+        # Progress is reported against the (k, q) pairs this rank owns, so it advances
+        # evenly no matter whether the k or the q dimension dominates.
+        _work_total = max(len(my_active_indices) * max(nqs_group, 1), 1)
+        _work_done = 0
+        _decile_done = 0
 
-        ik_all = -1
-        for send_rank in range(self.rank_size):
-            eigen_vecs_recv, eigen_recv = self.comm.bcast((eigen_vecs, eigen), root=send_rank)
-        
-            for ik, k in enumerate(k_grid_all[send_rank]):
-                ik_all += 1
-                eig_k, wave_k = eigen_recv[:, ik], eigen_vecs_recv[ik, :]
-                for ibnd in range(nbands):
-                    if eig_k[ibnd] > efocus_max:
-                        rate_all[ibnd, ik_all] = np.inf
-                        continue
-                    phase_k = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*k[None,:], axis=-1)) # shape: (ncells,)
+        # Pre-compute the q-dependent prefactor of the dipole correction; see the comment in
+        # rate_cal_polar.  A_qm only depends on (q, imode), so it is hoisted out of the k loop.
+        # Unlike the polar/rmp branches, which require the correction, this one also has to
+        # honour apply_correction: without it the coupling is short-range only.
+        corr_mask = (self.apply_correction & (np.linalg.norm(q_grid_group, axis=-1) < self.q_cut)) if nqs_group else np.empty(0, dtype=bool)
+        # A_qm depends only on (q, imode) and every rank of a q-group would otherwise build
+        # the same table, so the q are shared out over the group and the result allgathered
+        # -- the same pattern as the phonon spectrum above.
+        _aq_counts = np.zeros(nk_groups, dtype=int)
+        for i in range(nqs_group):
+            _aq_counts[i % nk_groups] += 1
+        _aq_cum = np.cumsum(_aq_counts)
+        _aq_lo = int(_aq_cum[k_group_id] - _aq_counts[k_group_id])
+        _aq_hi = int(_aq_cum[k_group_id])
+        _A_local = np.zeros((_aq_hi - _aq_lo, nmodes), dtype=complex)
+        for _aj in range(_aq_hi - _aq_lo):
+            iq = _aq_lo + _aj
+            if not corr_mask[iq]:
+                continue
+            q = q_grid_group[iq]
+            freq = freq_grid[iq]
+            qG_vec_cart, exp_inner_term = self._get_LRC_ewald_G(q)
+            # Quantities shared by every branch.
+            atomic_phase_G = np.exp(-1.0j*np.einsum('ga, ka->kg', qG_vec_cart, self.graph_data.pos))
+            temp2 = np.exp(-exp_inner_term / self.ewald_param) / exp_inner_term
+            # Branches below the phonon cutoff are gated out by _get_match_table, so their
+            # prefactor stays zero; the rest are contracted in one einsum over the branch axis.
+            valid_modes = freq >= self.phonon_cutoff
+            A_qm = np.zeros(nmodes, dtype=complex)
+            if np.any(valid_modes):
+                atomic_phase = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.pos*q[None,:], axis=-1))
+                phvec_wap_iq = atomic_phase[None,:,None] * phon_vecs[iq]
+                phvec_valid = phvec_wap_iq[valid_modes]
+                freq_valid = freq[valid_modes]
+                temp1_all = np.einsum('gi, kij, mkj->mkg', qG_vec_cart, self.BECs, phvec_valid)
+                temp3_all = temp1_all * temp2[None,None,:] * atomic_phase_G[None,:,:]
+                factor_all = 1.0 / np.sqrt(2.0 * self.atomic_mass[None,:] * np.abs(freq_valid[:,None]))
+                A_qm[valid_modes] = Hamcts.JFOURPI * np.einsum('mkg, mk->m', temp3_all, factor_all) / self.volume_uc
+            _A_local[_aj] = A_qm
+        A_qm_cache = (np.concatenate(comm_k.allgather(_A_local), axis=0)
+                      if nqs_group else np.zeros((0, nmodes), dtype=complex))
 
-                    for iq, q in enumerate(q_grid[self.rank]):
-                        apply_correction_for_this_q = self.apply_correction and (np.linalg.norm(q) < self.q_cut)
+        # Only the cells that survive the cell cut ever enter the phase factors.
+        nbr_shift_cut = self.nbr_shift_of_cell_sc[self.cell_cut_list]   # (ncells_cut, 3)
+        # _elec_cal_partial materialises H(k) and S(k) for the whole batch, i.e.
+        # nk * norbs^2 * 32 B.  Cap the batch so that stays bounded whatever the
+        # basis size: a small basis then runs unbatched in practice, while a large
+        # one is split rather than allocating the whole batch at once.
+        _q_batch = max(1, int(_BATCH_BYTES / (32.0 * self.norbs ** 2)))
+        # Main loop: this rank's own active k points outer, its q subset inner.
+        for _i_loc, ik_all in enumerate(my_active_indices):
+                k = k_grid[ik_all]
+                eig_k = all_eigens[:, ik_all]
+                wave_k = active_waves[_k_lo + _i_loc]
+                skip_mask = (eig_k > efocus_max) | (eig_k < efocus_min)
+                if skip_mask.all():
+                    continue
+                phase_k = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*k[None,:], axis=-1)) # shape: (ncells,)
+                # grad_mat is indexed [A, B, m, n, i, j] with A <- conj(phase_kpq),
+                # B <- phase_k, m <- conj(wave_kpq), n <- wave_k.  Folding phase_k and
+                # wave_k in once per k point replaces the loop over cell pairs for every
+                # (q, band pair, branch), and drops the second orbital axis.
+                # B is contracted before n: B leads grad_mat[A], so (B, m*n*i*j) is a
+                # contiguous view and the product never transposes the slice.  Taking n
+                # first would, since axis 2 is not trailing.
+                _pk_cut = phase_k[self.cell_cut_list].astype(np.complex128)
+                _nB = len(self.cell_cut_list)
+                grad_contracted_k = np.empty((_nB, self.norbs,
+                                              self.natoms, 3, nbands), dtype=np.complex128)
+                _gm_is_complex = np.iscomplexobj(self.grad_mat)
+                # Real grad_mat (no SOC): split phase_k into its real and imaginary rows so a
+                # single GEMM covers both and grad_mat is read only once.
+                _pk_ri = None if _gm_is_complex else np.stack([_pk_cut.real, _pk_cut.imag])
+                _wkT = np.ascontiguousarray(wave_k.T)             # (norbs, nbands)
+                for _iA in range(_nB):
+                    _gA = self.grad_mat[_iA].reshape(_nB, -1)     # (B, m*n*i*j) view
+                    if _gm_is_complex:
+                        _tB = _pk_cut @ _gA
+                    else:
+                        _ri = _pk_ri @ _gA
+                        _tB = _ri[0] + 1j*_ri[1]
+                    _tB = _tB.reshape(self.norbs, self.norbs, self.natoms*3) # (m, n, i*j)
+                    # (m, i*j, n) @ (n, nbands) -> (m, i*j, nbands), all bands in one call
+                    grad_contracted_k[_iA] = np.matmul(
+                        _tB.transpose(0, 2, 1), _wkT).reshape(
+                            self.norbs, self.natoms, 3, nbands)
+                    del _tB
+                # S(k) contracted over cells, for the dipole correction.
+                phase_k_uc = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.nbr_shift_of_cell*k[None,:], axis=-1))
+                SK_k = np.einsum('n, nij->ij', phase_k_uc, self.graph_data.S_cell)
+                # S(k) enters only through conj(wave_kpq) . S(k) . wave_k^T and both depend
+                # on k alone, so fold wave_k in here rather than per band pair.
+                _Sw_k = SK_k @ wave_k.T # (norbs, nbands)
+                kpq_all = k + q_grid_group                            # (nqs_group, 3)
+                # k+q states and cell phases are evaluated in batches instead of one q at a time:
+                # the diagonalisation is batched over the chunk, only the bands in band_indice are
+                # requested, and the cell phase is built in one call over the cells that survive the
+                # cell cut.  A chunk rather than the whole q subset keeps the batch arrays bounded.
+                for _q_start in range(0, nqs_group, _q_batch):
+                    _q_end = min(_q_start + _q_batch, nqs_group)
+                    eig_kpq_b, wave_kpq_b = self._elec_cal_partial(kpq_all[_q_start:_q_end], band_indice)
+                    phase_kpq_cut_b = np.exp(Hamcts.JTWOPI*np.einsum('qd, nd->qn',
+                                             kpq_all[_q_start:_q_end], nbr_shift_cut)).astype(np.complex128)
+                    for _iq_b in range(_q_end - _q_start):
+                        iq = _q_start + _iq_b
+                        q = q_grid_group[iq]
+                        apply_correction_for_this_q = corr_mask[iq]
                         # phonon spectrum
                         freq = freq_grid[iq]
                         eigen_vec_phon = phon_vecs[iq]
                         atomic_phase = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.pos*q[None,:], axis=-1)) # shape (natoms, )
                         phvec_wap = atomic_phase[None,:,None] * eigen_vec_phon # shape (nbranches, natoms, 3)
                         bose_qvs = bose_weight(freq, self.temperature)
-
                         # calculate the electronic info for k+q
-                        kpq = k + q
-                        eig_kpq, wave_kpq = self._elec_cal(kpq)
-                        eig_kpq = eig_kpq[band_indice, 0]
-                        wave_kpq = wave_kpq[0, band_indice, :]
+                        eig_kpq = eig_kpq_b[:, _iq_b]
+                        wave_kpq = wave_kpq_b[_iq_b]
                         match_table = self._get_match_table(eig_k, eig_kpq, freq)
+                        # Every contribution below is gated by the match table, so when it
+                        # selects nothing for this (k, q) the cell contraction and the
+                        # band/branch contractions are skipped altogether.  The energy
+                        # window makes this the common case.
+                        if not np.any(match_table[~skip_mask]):
+                            continue
                         fermi_kpqs = fermi_weight(eig_kpq - self.efermi, self.temperature)
                         # cal epc
-                        phase_kpq = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*(kpq)[None,:], axis=-1)) # shape: (ncells,)
-                        for jbnd in range(nbands):
-                            tmp1 = np.einsum('m,n -> mn', np.conj(wave_kpq[jbnd]), wave_k[ibnd])
-                            # calculate epc
-                            for branch_idx in range(nmodes):
-                                if match_table[ibnd, jbnd, branch_idx]:
-                                    factor = 1.0 / np.sqrt(2.0 * self.atomic_mass * abs(freq[branch_idx])) # shape:(natoms,)
-                                    tmp2 = np.einsum('ij,mn -> mnij', factor[:,None]*phvec_wap[branch_idx], tmp1)
-                                    
-                                    epc = 0.0
-                                    for i_m, m in enumerate(self.cell_cut_list): # ncells
-                                        for i_n, n in enumerate(self.cell_cut_list): # ncells  
-                                            epc += np.conj(phase_kpq[m])*phase_k[n]*np.einsum('mnij,mnij', tmp2, self.grad_mat[i_m,i_n])
-                                    
-                                    # Correction of long-range interactions
-                                    if apply_correction_for_this_q:
-                                        epc_corr = self._dipole_correction(tmp1, k, q, factor, phvec_wap[branch_idx])
-                                    else:
-                                        epc_corr = 0.0
-                                    epc = epc + epc_corr
-                                    delta_f1 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] + freq[branch_idx]) * self.inv_smearq) * self.inv_smearq
-                                    delta_f2 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] - freq[branch_idx]) * self.inv_smearq) * self.inv_smearq
-                                    g2_tmp = np.abs(epc) * np.abs(epc)
-                                    rate_all[ibnd,ik_all] += g2_tmp * ((bose_qvs[branch_idx] + fermi_kpqs[jbnd]) * delta_f1 + 
-                                                                    (bose_qvs[branch_idx] + 1.0 - fermi_kpqs[jbnd]) * delta_f2) * weights_q_local[iq] 
-            if self.rank == 0:
-                logger.step(send_rank+1)
+                        grad_ph = np.tensordot(np.conj(phase_kpq_cut_b[_iq_b]),
+                                              grad_contracted_k, axes=([0], [0])) # (m,i,j,nbands)
+                        # Built for every mode at once, so the branches the match table
+                        # discards are formed too; leaving 1/sqrt(0) in them would put an
+                        # inf where the per-element code never evaluates anything.
+                        factor_all = np.zeros((len(freq), len(self.atomic_mass)))
+                        _fv = freq >= self.phonon_cutoff
+                        factor_all[_fv] = 1.0 / np.sqrt(
+                            2.0 * self.atomic_mass[None, :] * np.abs(freq[_fv, None]))
+                        if apply_correction_for_this_q and self._lrc_cacheable:
+                            sum_r_all = np.conj(wave_kpq) @ _Sw_k # (nbands, nbands)
+                            A_qm = A_qm_cache[iq]
+                        for ibnd in range(nbands):
+                            if skip_mask[ibnd]:
+                                continue
+                            # Tested before the contractions below rather than after: the
+                            # energy window makes an empty row the common case.
+                            mt = match_table[ibnd] # (nbands, nmodes)
+                            if not np.any(mt):
+                                continue
+                            grad_partial = grad_ph[..., ibnd] # (norbs, natoms, 3); wave_k already folded in
+                            # grad_elec for ALL jbnd at once: (nbands, natoms, 3)
+                            grad_elec_all = np.einsum('jm, mab -> jab', np.conj(wave_kpq), grad_partial)
+                            # epc for all (jbnd, imode): (nbands, nmodes)
+                            epc_mat = np.einsum('jax, max, ma -> jm', grad_elec_all, phvec_wap, factor_all)
+                            if apply_correction_for_this_q:
+                                # The long-range dipole term is added in, so g2 is the full
+                                # |g_short + g_corr|^2 and can never come out negative.
+                                if self._lrc_cacheable:
+                                    epc_mat = epc_mat + A_qm[None, :] * sum_r_all[:, ibnd, None]
+                                else:
+                                    epc_mat = epc_mat + self._dipole_correction_mat(
+                                        ibnd, wave_k, wave_kpq, k, q, factor_all, phvec_wap, freq)
+                            g2_mat = np.abs(epc_mat) ** 2 # (nbands, nmodes)
+                            de = eig_k[ibnd] - eig_kpq # (nbands,)
+                            d1 = w0gauss((de[:, None] + freq[None, :]) * self.inv_smearq) * self.inv_smearq
+                            d2 = w0gauss((de[:, None] - freq[None, :]) * self.inv_smearq) * self.inv_smearq
+                            bose = bose_qvs[None, :]    # (1, nmodes)
+                            fermi = fermi_kpqs[:, None] # (nbands, 1)
+                            if self.ishole:
+                                # For holes the roles of the emission and absorption
+                                # occupations swap.
+                                contrib = g2_mat * mt * ((bose + 1.0 - fermi) * d1 +
+                                                         (bose + fermi) * d2)
+                            else:
+                                contrib = g2_mat * mt * ((bose + fermi) * d1 +
+                                                         (bose + 1.0 - fermi) * d2)
+                            rate_all[ibnd, ik_all] += weights_q_local[iq] * contrib.sum()
+                    # Counted per q batch rather than per k point: a rank owns only a few
+                    # active k, so a per-k update could not resolve single percent steps.
+                    _work_done += _q_end - _q_start
+                    _decile = int(100 * _work_done / _work_total)
+                    if self.rank == 0 and _decile > _decile_done:
+                        _decile_done = _decile
+                        logger.step(_decile)
+
+        comm_k.Free()
+        k_row_comm.Free()
         rate_all *= Hamcts.TWOPI
-        # The rate_all of the whole q is obtained by allreducing the rate_all of each process
+        # Each rank accumulated the contribution of its own q subset; the Allreduce(SUM)
+        # completes the q integral.  It moves only a few
+        # hundred kB but cannot finish until every rank has arrived, so an imbalanced
+        # workload appears as a long silence after the progress bar reaches 100% -- that bar
+        # tracks rank 0 alone.  The first message without the second therefore means the run
+        # is still waiting for the slowest rank, not that it has deadlocked.
         if self.comm is not None:
+            if self.rank == 0:
+                print('  waiting for all ranks at the rate_all reduction...', flush=True)
+            _t_wait = time.time()
             self.comm.Allreduce(MPI.IN_PLACE, rate_all, op=MPI.SUM)
+            if self.rank == 0:
+                print('  reduction done after waiting {:.0f}s for the slowest rank.'.format(
+                    time.time() - _t_wait), flush=True)
         return rate_all
 
     def rate_cal_MRTA(self, k_grid, q_grid, bands_indices, ecbm, is_mrta=False):
@@ -1727,94 +2131,231 @@ class EPC_calculator(object):
         nks = len(k_grid)
         nqs = len(q_grid)
 
-        # get cbm plus over_cbm to obtain the energy range we focus on
-        efocus_max = ecbm + self.over_cbm
+        # Energy window around the band edge: above the CBM for electrons, below the VBM
+        # for holes (ecbm holds the VBM energy when ishole is set).
+        if self.ishole:
+            efocus_min = ecbm - self.over_vbm
+            efocus_max = np.inf
+        else:
+            efocus_min = -np.inf
+            efocus_max = ecbm + self.over_cbm
 
         rate_all = np.zeros((nbands, nks))
 
-        # q points are parallelized and q grid is split
-        split_sections = np.zeros(self.rank_size, dtype=int)
+        # The q points are shared out over the ranks and every rank keeps all the active k
+        # points, so q is the only dimension that is split and the reduction at the end is a
+        # single sum.  With q on the outer loop the per-q work -- the phonon spectrum and the
+        # dipole prefactor A_qm -- is amortised over every active k point at once, so it is
+        # paid as rarely as possible.
+        _q_split = np.zeros(self.rank_size, dtype=int)
         for i in range(nqs):
-            split_sections[i%self.rank_size] += 1
-        split_sections = np.cumsum(split_sections, axis=0)
-        q_grid = np.split(q_grid, indices_or_sections=split_sections, axis=0)
-        weights_q = np.split(self.weight_q, indices_or_sections=split_sections, axis=0)
+            _q_split[i % self.rank_size] += 1
+        _q_cumsum = np.cumsum(_q_split)
+        _q_start = int(_q_cumsum[self.rank] - _q_split[self.rank])
+        _q_end = int(_q_cumsum[self.rank])
+        nqs_group = _q_end - _q_start
+        q_grid_group = q_grid[_q_start:_q_end]
+        weights_q_local = self.weight_q[_q_start:_q_end]
         self.weight_q = None
-        if q_grid[self.rank].size>0:
-            # calculate the phonon spectrum in parallel
-            freq_grid, phon_vecs = self._phonon_cal(q_grid[self.rank])
-            nqs_local = len(freq_grid)
-            phon_vecs = phon_vecs.reshape(nqs_local, nmodes, self.natoms, 3)
-            weights_q_local = weights_q[self.rank]
-            del weights_q
+
+        # Phonon frequencies and eigenvectors for this rank's own q subset.
+        if nqs_group > 0:
+            freq_grid, phon_vecs = self._phonon_cal(q_grid_group)
+            phon_vecs = phon_vecs.reshape(-1, nmodes, self.natoms, 3)
             # change fractional coordinates to cartesian coordinates
-            q_grid[self.rank] = self._frac2car(q_grid[self.rank])
+            q_grid_group = self._frac2car(q_grid_group)
         else:
-            q_grid[self.rank] = np.empty((0, 3))
-        
-        # k grid is split
-        if self.rank == 0:
-            print('k grid parallel is also switched on!')
-        split_sections = np.zeros(self.rank_size, dtype=int)
+            freq_grid = np.empty((0, nmodes))
+            phon_vecs = np.empty((0, nmodes, self.natoms, 3))
+            q_grid_group = np.empty((0, 3))
+
+        # Band energies and wave functions on the k grid.  The mesh is split over the ranks
+        # so that no rank diagonalises more than its share.  The band energies are then
+        # gathered globally, because every rank has to agree on which k points fall inside
+        # the energy window and needs eig_k in the main loop; the payload is only
+        # nbands * nks * 8 B.  The wave functions are gathered for the *active* k points
+        # alone: the full set would waste nks * nbands * norbs * 16 B on every rank -- tens
+        # of GB per node at high rank counts, and large enough to overflow mpi4py's pickle
+        # protocol -- whereas the active subset costs n_active * nbands * norbs * 16 B.
+        _k_split = np.zeros(self.rank_size, dtype=int)
         for i in range(nks):
-            split_sections[i%self.rank_size] += 1
-        split_sections = np.cumsum(split_sections, axis=0)
-        k_grid_all = np.split(k_grid, indices_or_sections=split_sections, axis=0)
-        if k_grid_all[self.rank].size > 0:            
-            # eigen: (norbs, nk_local) eigen_vecs: (nk_local, norbs, norbs)
-            eigen, eigen_vecs = self._elec_cal(k_grid_all[self.rank])
-            eigen = eigen[band_indice, :]
-            eigen_vecs = eigen_vecs[:, band_indice, :]
+            _k_split[i % self.rank_size] += 1
+        _k_split_cum = np.cumsum(_k_split)
+        k_start_idx = int(_k_split_cum[self.rank] - _k_split[self.rank])
+        k_end_idx = int(_k_split_cum[self.rank])
+        k_grid_local = k_grid[k_start_idx:k_end_idx]
+        if k_grid_local.size > 0:
+            eigen_local, eigen_vecs_local = self._elec_cal_partial(k_grid_local, band_indice)
         else:
-            eigen, eigen_vecs = np.empty((nbands, 0)), np.empty((0, nbands, self.norbs))
+            eigen_local = np.empty((nbands, 0))
+            eigen_vecs_local = np.empty((0, nbands, self.norbs), dtype=np.complex128)
+        all_eigens = np.concatenate(
+            self.comm.allgather(np.ascontiguousarray(eigen_local, dtype=np.float64)), axis=1) # (nbands, nks)
 
+        # Mark the k points outside the energy window and keep only the active ones.
+        rate_all[all_eigens > efocus_max] = np.inf
+        active_k_mask = np.any(all_eigens <= efocus_max, axis=0)
+        active_k_indices = np.where(active_k_mask)[0]
+        n_active = len(active_k_indices)
         if self.rank == 0:
-            logger = time_logger(total_cycles=self.rank_size, routine_name='rate_cal_polar')
+            print('  active k points: {} / {} ({:.2f}%)'.format(n_active, nks, 100.0*n_active/max(nks,1)), flush=True)
 
-        ik_all = -1
+        # Assembled in ascending k order, so active_waves[i] belongs to active_k_indices[i].
+        _mine_in_slice = active_k_indices[(active_k_indices >= k_start_idx) & (active_k_indices < k_end_idx)]
+        active_waves = np.concatenate(self.comm.allgather(np.ascontiguousarray(
+            eigen_vecs_local[_mine_in_slice - k_start_idx], dtype=np.complex128)), axis=0) # (n_active, nbands, norbs)
 
-        for send_rank in range(self.rank_size):
-            eigen_vecs_recv, eigen_recv = self.comm.bcast((eigen_vecs, eigen), root=send_rank)
-            for ik, k in enumerate(k_grid_all[send_rank]):
-                ik_all += 1
-                eig_k, wave_k = eigen_recv[:, ik], eigen_vecs_recv[ik, :]
-                for ibnd in range(nbands):
-                    if eig_k[ibnd] > efocus_max:
-                        rate_all[ibnd, ik_all] = np.inf
+        # Every rank walks all the active k points; only the q integral is split, so
+        # active_waves[i] is the wave function of my_active_indices[i].
+        my_active_indices = active_k_indices
+
+        # Pre-compute the q-dependent prefactor of the dipole correction.  For
+        # LRC_taylor_order == 0 the correction factorises exactly as
+        #     epc(k, ibnd, jbnd, q, imode) = A_qm(q, imode) * sum_r(k, ibnd, jbnd)
+        # because _dipole_correction multiplies a purely (q, imode)-dependent Ewald sum by
+        # sum_r, which only involves the overlap matrix and the two wave functions.  A_qm
+        # therefore only needs to be evaluated once per (q, imode) instead of once per
+        # (k, ibnd, jbnd, q, imode).
+        q_active = np.flatnonzero(np.linalg.norm(q_grid_group, axis=-1) < self.q_cut) if nqs_group else np.empty(0, dtype=int)
+        A_qm_cache = {}
+        for iq in q_active:
+            q = q_grid_group[iq]
+            freq = freq_grid[iq]
+            qG_vec_cart, exp_inner_term = self._get_LRC_ewald_G(q)
+            # Quantities shared by every branch.
+            atomic_phase_G = np.exp(-1.0j*np.einsum('ga, ka->kg', qG_vec_cart, self.graph_data.pos)) # (natoms, ngs)
+            temp2 = np.exp(-exp_inner_term / self.ewald_param) / exp_inner_term # (ngs,)
+            # Branches below the phonon cutoff are switched off by _get_match_table, which
+            # gates every contribution below, so their prefactor is left at zero instead of
+            # being evaluated.  The surviving branches are contracted in a single einsum over
+            # the branch axis rather than one Python iteration each.
+            valid_modes = freq >= self.phonon_cutoff # (nmodes,)
+            A_qm = np.zeros(nmodes, dtype=complex)
+            if np.any(valid_modes):
+                atomic_phase = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.pos*q[None,:], axis=-1)) # (natoms,)
+                phvec_wap = atomic_phase[None,:,None] * phon_vecs[iq] # (nmodes, natoms, 3)
+                phvec_valid = phvec_wap[valid_modes] # (nv, natoms, 3)
+                freq_valid = freq[valid_modes] # (nv,)
+                temp1_all = np.einsum('gi, kij, mkj->mkg', qG_vec_cart, self.BECs, phvec_valid) # (nv, natoms, ngs)
+                temp3_all = temp1_all * temp2[None,None,:] * atomic_phase_G[None,:,:]
+                factor_all = 1.0 / np.sqrt(2.0 * self.atomic_mass[None,:] * np.abs(freq_valid[:,None])) # (nv, natoms)
+                A_qm[valid_modes] = Hamcts.JFOURPI * np.einsum('mkg, mk->m', temp3_all, factor_all) / self.volume_uc
+            A_qm_cache[int(iq)] = A_qm
+
+        # Report progress in 1% steps: the loop runs over q points, whose number can be
+        # very large, so one line per iteration would flood the log.
+        if self.rank == 0:
+            logger = time_logger(total_cycles=100, routine_name='rate_cal_polar', line_per_step=True)
+        # Progress is reported against the (k, q) pairs this rank owns, so it advances
+        # evenly no matter whether the k or the q dimension dominates.
+        _work_total = max(len(q_active) * len(my_active_indices), 1)
+        _work_done = 0
+        _decile_done = 0
+
+        # Main loop: q outer, this rank's own k points inner.  Every rank only
+        # diagonalises k+q for the k points it owns, so nothing has to be exchanged.
+        _k_batch = max(1, int(_BATCH_BYTES / (32.0 * self.norbs ** 2)))
+        k_grid_my = k_grid[my_active_indices]
+        n_my = len(my_active_indices)
+        # S(k) enters only through  sum_r[jbnd, ibnd] = conj(wave_kpq[jbnd]) . S(k) . wave_k[ibnd],
+        # and S(k) depends on k alone.  With q on the outer loop a naive placement rebuilds it
+        # for every (k, q) pair, which streams the whole of S_cell (ncells x norbs^2) once per
+        # pair, which for a large basis is by far the dominant cost of this routine.  Matrix multiplication is associative, so cache
+        #     Sw_k = S(k) . wave_k^T          shape (norbs, nbands)
+        # once per k instead.  That is nbands/norbs of the memory and leaves a
+        # (nbands, norbs) @ (norbs, nbands) product per pair.
+        _Sw_k = np.empty((n_my, self.norbs, nbands), dtype=np.complex128)
+        for _i_k in range(n_my):
+            _ph_uc = np.exp(Hamcts.JTWOPI*np.sum(
+                self.graph_data.nbr_shift_of_cell*k_grid_my[_i_k][None,:], axis=-1))
+            _SK = np.einsum('n, nij->ij', _ph_uc, self.graph_data.S_cell) # (norbs, norbs)
+            _Sw_k[_i_k] = _SK @ active_waves[_i_k].T
+            del _SK
+        for _iq_count, iq in enumerate(q_active):
+            q = q_grid_group[iq]
+            freq = freq_grid[iq]
+            bose_qvs = bose_weight(freq, self.temperature)
+            if self._lrc_cacheable:
+                A_qm2 = np.abs(A_qm_cache[iq]) ** 2
+            else:
+                # The per-(band pair, branch) fallback needs the phonon quantities that the
+                # cached path folds into A_qm once per q.
+                _at_ph = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.pos*q[None,:], axis=-1))
+                phvec_wap_q = _at_ph[None,:,None] * phon_vecs[iq] # (nmodes, natoms, 3)
+                factor_all_q = 1.0 / np.sqrt(
+                    2.0 * self.atomic_mass[None, :] * np.abs(freq[:, None])) # (nmodes, natoms)
+            if n_my == 0:
+                continue
+            # Same batching as in the other branches: bound the batched H/S arrays.
+            for _k_start in range(0, n_my, _k_batch):
+                _k_end = min(_k_start + _k_batch, n_my)
+                eig_kpq_b, wave_kpq_b = self._elec_cal_partial(
+                    k_grid_my[_k_start:_k_end] + q[None, :], band_indice)
+                for _i_b in range(_k_end - _k_start):
+                    i_loc = _k_start + _i_b
+                    ik_all = my_active_indices[i_loc]
+                    eig_k = all_eigens[:, ik_all]
+                    skip_mask = (eig_k > efocus_max) | (eig_k < efocus_min)
+                    if skip_mask.all():
                         continue
-                    for iq, q in enumerate(q_grid[self.rank]):
-                        if np.linalg.norm(q) < self.q_cut:
-                            # phonon spectrum
-                            freq = freq_grid[iq]
-                            eigen_vec_phon = phon_vecs[iq]
-                            atomic_phase = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.pos*q[None,:], axis=-1)) # shape (natoms, )
-                            phvec_wap = atomic_phase[None,:,None] * eigen_vec_phon # shape (nbranches, natoms, 3)
-                            bose_qvs = bose_weight(freq, self.temperature)
-                            # calculate the electronic info for k+q
-                            kpq = k + q
-                            eig_kpq, wave_kpq = self._elec_cal(kpq)
-                            eig_kpq = eig_kpq[band_indice, 0]
-                            wave_kpq = wave_kpq[0, band_indice, :]
-                            match_table = self._get_match_table(eig_k, eig_kpq, freq)
-                            fermi_kpqs = fermi_weight(eig_kpq - self.efermi, self.temperature)
-                            # cal epc
-                            for jbnd in range(nbands):
-                                tmp1 = np.einsum('m,n -> mn', np.conj(wave_kpq[jbnd]), wave_k[ibnd])
-                                for imode in range(nmodes):
-                                    factor = 1.0 / np.sqrt(2.0 * self.atomic_mass * abs(freq[imode])) # shape:(natoms,)
-                                    if match_table[ibnd, jbnd, imode]:
-                                        epc = self._dipole_correction(tmp1, k, q, factor, phvec_wap[imode])
-                                        delta_f1 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] + freq[imode]) * self.inv_smearq) * self.inv_smearq
-                                        delta_f2 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] - freq[imode]) * self.inv_smearq) * self.inv_smearq
-                                        g2_tmp = np.abs(epc) * np.abs(epc)
-                                        rate_all[ibnd, ik_all] += weights_q_local[iq] * g2_tmp * ((bose_qvs[imode] + fermi_kpqs[jbnd]) * delta_f1 + (bose_qvs[imode] + 1.0 - fermi_kpqs[jbnd]) * delta_f2)
-            if self.rank == 0:
-                logger.step(send_rank+1)
+                    eig_kpq = eig_kpq_b[:, _i_b]
+                    wave_kpq = wave_kpq_b[_i_b]
+                    match_table = self._get_match_table(eig_k, eig_kpq, freq)
+                    # The contribution below is gated by the match table, so when it selects
+                    # nothing for this (k, q) the overlap and coupling contractions are skipped.
+                    if not np.any(match_table[~skip_mask]):
+                        continue
+                    fermi_kpqs = fermi_weight(eig_kpq - self.efermi, self.temperature)
+                    # cal epc; sum_r_all[jbnd, ibnd] replaces the per-band-pair einsum.
+                    # S(k) . wave_k^T was cached per k above, so nothing k-only is rebuilt here.
+                    if self._lrc_cacheable:
+                        sum_r_all = np.conj(wave_kpq) @ _Sw_k[i_loc] # (nbands, nbands)
+                        # |g|^2 for every (ibnd, jbnd, imode) at once
+                        g2_all = (np.abs(sum_r_all.T) ** 2)[:, :, None] * A_qm2[None, None, :]
+                    else:
+                        # First order does not factorise, so neither cache applies: evaluate
+                        # the correction per (band pair, branch) as before.
+                        g2_all = np.empty((nbands, nbands, nmodes))
+                        for ibnd in range(nbands):
+                            g2_all[ibnd] = np.abs(self._dipole_correction_mat(
+                                ibnd, active_waves[i_loc], wave_kpq, k_grid_my[i_loc], q,
+                                factor_all_q, phvec_wap_q, freq)) ** 2
+                    de = eig_k[:, None, None] - eig_kpq[None, :, None]
+                    fw = freq[None, None, :]
+                    delta_f1 = w0gauss((de + fw) * self.inv_smearq) * self.inv_smearq
+                    delta_f2 = w0gauss((de - fw) * self.inv_smearq) * self.inv_smearq
+                    bose = bose_qvs[None, None, :]
+                    fermi = fermi_kpqs[None, :, None]
+                    if self.ishole:
+                        # For holes the roles of the emission and absorption occupations swap.
+                        contrib = weights_q_local[iq] * g2_all * match_table * (
+                            (bose + 1.0 - fermi) * delta_f1 + (bose + fermi) * delta_f2)
+                    else:
+                        contrib = weights_q_local[iq] * g2_all * match_table * (
+                            (bose + fermi) * delta_f1 + (bose + 1.0 - fermi) * delta_f2)
+                    valid_ibnd = ~skip_mask
+                    rate_all[valid_ibnd, ik_all] += contrib.sum(axis=(1, 2))[valid_ibnd]
+            _work_done += n_my
+            _decile = int(100 * _work_done / _work_total)
+            if self.rank == 0 and _decile > _decile_done:
+                _decile_done = _decile
+                logger.step(_decile)
 
         rate_all *= Hamcts.TWOPI
-        # The rate_all of the whole q is obtained by allreducing the rate_all of each process
+        # Each rank accumulated the contribution of its own q subset, so the Allreduce(SUM)
+        # completes the q integral.  It moves only a few hundred kB but cannot finish until
+        # every rank has arrived, so an imbalanced workload appears as a long silence after the
+        # progress bar reaches 100% -- that bar tracks rank 0 alone.  The first message without
+        # the second therefore means the run is still waiting for the slowest rank rather than
+        # that it has deadlocked.
         if self.comm is not None:
+            if self.rank == 0:
+                print('  waiting for all ranks at the rate_all reduction...', flush=True)
+            _t_wait = time.time()
             self.comm.Allreduce(MPI.IN_PLACE, rate_all, op=MPI.SUM)
+            if self.rank == 0:
+                print('  reduction done after waiting {:.0f}s for the slowest rank.'.format(
+                    time.time() - _t_wait), flush=True)
         return rate_all
 
     def rate_cal_rmp(self, k_grid, q_grid, band_indice, ecbm):
@@ -1838,63 +2379,274 @@ class EPC_calculator(object):
         nks = len(k_grid)
         nqs = len(q_grid)
 
-        # get cbm plus over_cbm to obtain the energy range we focus on
-        efocus_max = ecbm + self.over_cbm
+        # Energy window around the band edge: above the CBM for electrons, below the VBM
+        # for holes (ecbm holds the VBM energy when ishole is set).
+        if self.ishole:
+            efocus_min = ecbm - self.over_vbm
+            efocus_max = np.inf
+        else:
+            efocus_min = -np.inf
+            efocus_max = ecbm + self.over_cbm
 
         rate_all = np.zeros((nbands, nks))
 
-        # q points are parallelized and q grid is split
-        split_sections = np.zeros(self.rank_size, dtype=int)
+        # ------------------------------------------------------------------
+        # Ranks are arranged as n_kgroups k-groups x rank_size / n_kgroups q-groups.  The
+        # per-k quantities built below are paid once per k point, so splitting k as well as
+        # q divides that part of the work by n_kgroups.  n_kgroups = 1 (the default) leaves
+        # the k points unsplit, i.e. the original pure q-parallel layout.
+        # ------------------------------------------------------------------
+        nk_groups = int(getattr(self, 'n_kgroups', 1))
+        if nk_groups < 1 or nk_groups > self.rank_size or (self.rank_size % nk_groups) != 0:
+            if self.rank == 0 and nk_groups != 1:
+                print('  WARNING: n_kgroups={} does not divide rank_size={}; '
+                      'falling back to 1 (pure q-parallel).'.format(nk_groups, self.rank_size), flush=True)
+            nk_groups = 1
+        nq_groups = self.rank_size // nk_groups
+        # Ranks of one k-group are consecutive, so the row collectives below stay on-node.
+        k_group_id = self.rank // nq_groups
+        q_group_id = self.rank % nq_groups
+        comm_k = self.comm.Split(color=q_group_id, key=k_group_id)      # same q, different k
+        k_row_comm = self.comm.Split(color=k_group_id, key=q_group_id)  # same k, different q
+
+        # q points are distributed over the q-groups; all ranks of a group share them.
+        _q_split = np.zeros(nq_groups, dtype=int)
         for i in range(nqs):
-            split_sections[i%self.rank_size] += 1
-        split_sections = np.cumsum(split_sections, axis=0)
-        q_grid = np.split(q_grid, indices_or_sections=split_sections, axis=0)
-        weights_q = np.split(self.weight_q, indices_or_sections=split_sections, axis=0)
+            _q_split[i % nq_groups] += 1
+        _q_cumsum = np.cumsum(_q_split)
+        _q_start = int(_q_cumsum[q_group_id] - _q_split[q_group_id])
+        _q_end = int(_q_cumsum[q_group_id])
+        nqs_group = _q_end - _q_start
+        q_grid_group = q_grid[_q_start:_q_end]
+        weights_q_local = self.weight_q[_q_start:_q_end]
         self.weight_q = None
-        if q_grid[self.rank].size>0:
-            # calculate the phonon spectrum in parallel
-            freq_grid, phon_vecs = self._phonon_cal(q_grid[self.rank])
-            nqs_local = len(freq_grid)
-            phon_vecs = phon_vecs.reshape(nqs_local, nmodes, self.natoms, 3)
-            weights_q_local = weights_q[self.rank]
-            del weights_q
+
+        # Phonons for this group's q subset: the k-ranks of a q-group need the same
+        # frequencies and eigenvectors, so they take a slice each and allgather rather than
+        # every rank repeating the whole subset.
+        if self.rank == 0:
+            print('  2D decomposition: {} k-groups x {} q-groups; {} q per group'.format(
+                nk_groups, nq_groups, nqs_group), flush=True)
+        if nqs_group > 0:
+            _ph_counts = np.zeros(nk_groups, dtype=int)
+            for i in range(nqs_group):
+                _ph_counts[i % nk_groups] += 1
+            _ph_cum = np.cumsum(_ph_counts)
+            _ph_lo = int(_ph_cum[k_group_id] - _ph_counts[k_group_id])
+            _ph_hi = int(_ph_cum[k_group_id])
+            if _ph_hi > _ph_lo:
+                freq_local, phon_local = self._phonon_cal(q_grid_group[_ph_lo:_ph_hi])
+                phon_local = phon_local.reshape(-1, nmodes, self.natoms, 3)
+            else:
+                freq_local = np.empty((0, nmodes))
+                phon_local = np.empty((0, nmodes, self.natoms, 3))
+            freq_grid = np.concatenate(comm_k.allgather(freq_local), axis=0)
+            phon_vecs = np.concatenate(comm_k.allgather(phon_local), axis=0)
             # change fractional coordinates to cartesian coordinates
-            q_grid[self.rank] = self._frac2car(q_grid[self.rank])
+            q_grid_group = self._frac2car(q_grid_group)
         else:
-            q_grid[self.rank] = np.empty((0, 3))
-        
-        # k grid is split
-        if self.rank == 0:
-            print('k grid parallel is also switched on!')
-        split_sections = np.zeros(self.rank_size, dtype=int)
+            freq_grid = np.empty((0, nmodes))
+            phon_vecs = np.empty((0, nmodes, self.natoms, 3))
+            q_grid_group = np.empty((0, 3))
+
+        # Only the band energies are needed globally: every rank must agree on which k
+        # points fall outside the energy window.  The wave functions are indexed only
+        # at the k points a rank owns, and gathering them everywhere would cost
+        # nks * nbands * norbs * 16 B per rank, so they stay local.
+        # The k grid is split over the k-ranks; within a column all q-groups need the
+        # same k data, so only q_group_id == 0 diagonalises and broadcasts along the row.
+        _k_split = np.zeros(nk_groups, dtype=int)
         for i in range(nks):
-            split_sections[i%self.rank_size] += 1
-        split_sections = np.cumsum(split_sections, axis=0)
-        k_grid_all = np.split(k_grid, indices_or_sections=split_sections, axis=0)
-        if k_grid_all[self.rank].size > 0:            
-            # eigen: (norbs, nk_local) eigen_vecs: (nk_local, norbs, norbs)
-            eigen, eigen_vecs = self._elec_cal(k_grid_all[self.rank])
-            eigen = eigen[band_indice, :]
-            eigen_vecs = eigen_vecs[:, band_indice, :]
+            _k_split[i % nk_groups] += 1
+        _k_split_cum = np.cumsum(_k_split)
+        k_start_idx = int(_k_split_cum[k_group_id] - _k_split[k_group_id])
+        k_end_idx = int(_k_split_cum[k_group_id])
+        k_grid_local = k_grid[k_start_idx:k_end_idx]
+        if nk_groups == 1:
+            # One k-group means k is not split: k_grid_local is already the whole grid and
+            # the gather below would be a no-op, but the q_group_id == 0 guard would still
+            # leave a single rank diagonalising while every other rank waits on the
+            # broadcast.  Each rank therefore diagonalises for itself, which is the
+            # redundant-but-parallel layout the pure q-parallel path expects.
+            eigen_local, eigen_vecs_local = self._elec_cal_partial(k_grid_local, band_indice)
+            all_eigens = np.ascontiguousarray(eigen_local, dtype=np.float64)
+            col0_comm = MPI.COMM_NULL
         else:
-            eigen, eigen_vecs = np.empty((nbands, 0)), np.empty((0, nbands, self.norbs))
+            if q_group_id == 0:
+                if k_grid_local.size > 0:
+                    eigen_local, eigen_vecs_local = self._elec_cal_partial(k_grid_local, band_indice)
+                else:
+                    eigen_local = np.empty((nbands, 0))
+                    eigen_vecs_local = np.empty((0, nbands, self.norbs), dtype=np.complex128)
+            else:
+                eigen_local, eigen_vecs_local = None, None
+
+            # The band energies are gathered globally: every rank must agree on which k points
+            # fall inside the energy window, and eig_k is needed in the main loop.  One
+            # representative per k-rank contributes and the assembled array goes back along the
+            # row; the payload is only nbands * nks * 8 B.
+            col0_color = 0 if q_group_id == 0 else MPI.UNDEFINED
+            col0_comm = self.comm.Split(color=col0_color, key=k_group_id)
+            if q_group_id == 0:
+                all_eigens = np.concatenate(
+                    col0_comm.allgather(np.ascontiguousarray(eigen_local, dtype=np.float64)), axis=1)
+            else:
+                all_eigens = None
+            all_eigens = k_row_comm.bcast(all_eigens, root=0)
+
+        # Mark the k points outside the energy window and keep only the active ones.
+        rate_all[all_eigens > efocus_max] = np.inf
+        active_k_mask = np.any(all_eigens <= efocus_max, axis=0)
+        active_k_indices = np.where(active_k_mask)[0]
+        n_active = len(active_k_indices)
+        if self.rank == 0:
+            print('  active k points: {} / {} ({:.2f}%)'.format(n_active, nks, 100.0*n_active/max(nks,1)), flush=True)
+
+        # Only the active k points enter the main loop, so replicating their wave functions
+        # is cheap and lets the *active* points be distributed below.  That matters for load
+        # balance: the energy window usually selects a clustered region, so slicing the raw
+        # mesh would leave most ranks idle.
+        _mine_in_slice = active_k_indices[(active_k_indices >= k_start_idx) & (active_k_indices < k_end_idx)]
+        if nk_groups == 1:
+            # Every rank already holds the eigenvectors of the whole grid, so the active
+            # subset is a plain slice; no gather or broadcast is involved.
+            active_waves = np.ascontiguousarray(
+                eigen_vecs_local[_mine_in_slice - k_start_idx], dtype=np.complex128)
+        else:
+            if q_group_id == 0:
+                active_waves = np.concatenate(col0_comm.allgather(np.ascontiguousarray(
+                    eigen_vecs_local[_mine_in_slice - k_start_idx], dtype=np.complex128)), axis=0)
+            else:
+                active_waves = None
+            active_waves = k_row_comm.bcast(active_waves, root=0)
+        if col0_comm != MPI.COMM_NULL:
+            col0_comm.Free()
+
+        # Distribute the active k points over the k-groups so every rank gets the same
+        # number of them no matter how they are spread over the mesh.  active_waves is
+        # assembled in ascending k order, so active_waves[_k_lo + i] is the wave function
+        # of my_active_indices[i].
+        _k_counts = np.zeros(nk_groups, dtype=int)
+        for i in range(n_active):
+            _k_counts[i % nk_groups] += 1
+        _k_cum = np.cumsum(_k_counts)
+        _k_lo = int(_k_cum[k_group_id] - _k_counts[k_group_id])
+        _k_hi = int(_k_cum[k_group_id])
+        my_active_indices = active_k_indices[_k_lo:_k_hi]
 
         if self.rank == 0:
-            logger = time_logger(total_cycles=self.rank_size, routine_name='rate_cal_rmp')
+            logger = time_logger(total_cycles=100, routine_name='rate_cal_rmp', line_per_step=True)
+        # Progress is reported against the (k, q) pairs this rank owns, so it advances
+        # evenly no matter whether the k or the q dimension dominates.
+        _work_total = max(len(my_active_indices) * max(nqs_group, 1), 1)
+        _work_done = 0
+        _decile_done = 0
 
-        ik_all = -1
-        for send_rank in range(self.rank_size):
-            eigen_vecs_recv, eigen_recv = self.comm.bcast((eigen_vecs, eigen), root=send_rank)
-            for ik, k in enumerate(k_grid_all[send_rank]):
-                ik_all += 1
-                eig_k, wave_k = eigen_recv[:, ik], eigen_vecs_recv[ik, :]
+        # Pre-compute the q-dependent prefactor of the dipole correction; see the comment in
+        # rate_cal_polar.  A_qm only depends on (q, imode), so it is hoisted out of the k loop.
+        corr_mask = (np.linalg.norm(q_grid_group, axis=-1) < self.q_cut) if nqs_group else np.empty(0, dtype=bool)
+        # A_qm depends only on (q, imode) and every rank of a q-group would otherwise build
+        # the same table, so the q are shared out over the group and the result allgathered
+        # -- the same pattern as the phonon spectrum above.
+        _aq_counts = np.zeros(nk_groups, dtype=int)
+        for i in range(nqs_group):
+            _aq_counts[i % nk_groups] += 1
+        _aq_cum = np.cumsum(_aq_counts)
+        _aq_lo = int(_aq_cum[k_group_id] - _aq_counts[k_group_id])
+        _aq_hi = int(_aq_cum[k_group_id])
+        _A_local = np.zeros((_aq_hi - _aq_lo, nmodes), dtype=complex)
+        for _aj in range(_aq_hi - _aq_lo):
+            iq = _aq_lo + _aj
+            if not corr_mask[iq]:
+                continue
+            q = q_grid_group[iq]
+            freq = freq_grid[iq]
+            qG_vec_cart, exp_inner_term = self._get_LRC_ewald_G(q)
+            # Quantities shared by every branch.
+            atomic_phase_G = np.exp(-1.0j*np.einsum('ga, ka->kg', qG_vec_cart, self.graph_data.pos))
+            temp2 = np.exp(-exp_inner_term / self.ewald_param) / exp_inner_term
+            # Branches below the phonon cutoff are gated out by _get_match_table, so their
+            # prefactor stays zero; the rest are contracted in one einsum over the branch axis.
+            valid_modes = freq >= self.phonon_cutoff
+            A_qm = np.zeros(nmodes, dtype=complex)
+            if np.any(valid_modes):
+                atomic_phase = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.pos*q[None,:], axis=-1))
+                phvec_wap_iq = atomic_phase[None,:,None] * phon_vecs[iq]
+                phvec_valid = phvec_wap_iq[valid_modes]
+                freq_valid = freq[valid_modes]
+                temp1_all = np.einsum('gi, kij, mkj->mkg', qG_vec_cart, self.BECs, phvec_valid)
+                temp3_all = temp1_all * temp2[None,None,:] * atomic_phase_G[None,:,:]
+                factor_all = 1.0 / np.sqrt(2.0 * self.atomic_mass[None,:] * np.abs(freq_valid[:,None]))
+                A_qm[valid_modes] = Hamcts.JFOURPI * np.einsum('mkg, mk->m', temp3_all, factor_all) / self.volume_uc
+            _A_local[_aj] = A_qm
+        A_qm_cache = (np.concatenate(comm_k.allgather(_A_local), axis=0)
+                      if nqs_group else np.zeros((0, nmodes), dtype=complex))
+
+        # Only the cells that survive the cell cut ever enter the phase factors.
+        nbr_shift_cut = self.nbr_shift_of_cell_sc[self.cell_cut_list]   # (ncells_cut, 3)
+        # _elec_cal_partial materialises H(k) and S(k) for the whole batch, i.e.
+        # nk * norbs^2 * 32 B.  Cap the batch so that stays bounded whatever the
+        # basis size: a small basis then runs unbatched in practice, while a large
+        # one is split rather than allocating the whole batch at once.
+        _q_batch = max(1, int(_BATCH_BYTES / (32.0 * self.norbs ** 2)))
+        # Main loop: this rank's own active k points outer, its q subset inner.
+        for _i_loc, ik_all in enumerate(my_active_indices):
+                k = k_grid[ik_all]
+                eig_k = all_eigens[:, ik_all]
+                wave_k = active_waves[_k_lo + _i_loc]
+                skip_mask = (eig_k > efocus_max) | (eig_k < efocus_min)
+                if skip_mask.all():
+                    continue
                 phase_k = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*k[None,:], axis=-1)) # shape: (ncells,)
-                for ibnd in range(nbands):
-                    if eig_k[ibnd] > efocus_max:
-                        rate_all[ibnd, ik_all] = np.inf
-                        continue
-                    for iq, q in enumerate(q_grid[self.rank]):
-                        apply_correction_for_this_q = np.linalg.norm(q) < self.q_cut
+                # grad_mat is indexed [A, B, m, n, i, j] with A <- conj(phase_kpq),
+                # B <- phase_k, m <- conj(wave_kpq), n <- wave_k.  Folding phase_k and
+                # wave_k in once per k point replaces the loop over cell pairs for every
+                # (q, band pair, branch), and drops the second orbital axis.
+                # B is contracted before n: B leads grad_mat[A], so (B, m*n*i*j) is a
+                # contiguous view and the product never transposes the slice.  Taking n
+                # first would, since axis 2 is not trailing.
+                _pk_cut = phase_k[self.cell_cut_list].astype(np.complex128)
+                _nB = len(self.cell_cut_list)
+                grad_contracted_k = np.empty((_nB, self.norbs,
+                                              self.natoms, 3, nbands), dtype=np.complex128)
+                _gm_is_complex = np.iscomplexobj(self.grad_mat)
+                # Real grad_mat (no SOC): split phase_k into its real and imaginary rows so a
+                # single GEMM covers both and grad_mat is read only once.
+                _pk_ri = None if _gm_is_complex else np.stack([_pk_cut.real, _pk_cut.imag])
+                _wkT = np.ascontiguousarray(wave_k.T)             # (norbs, nbands)
+                for _iA in range(_nB):
+                    _gA = self.grad_mat[_iA].reshape(_nB, -1)     # (B, m*n*i*j) view
+                    if _gm_is_complex:
+                        _tB = _pk_cut @ _gA
+                    else:
+                        _ri = _pk_ri @ _gA
+                        _tB = _ri[0] + 1j*_ri[1]
+                    _tB = _tB.reshape(self.norbs, self.norbs, self.natoms*3) # (m, n, i*j)
+                    # (m, i*j, n) @ (n, nbands) -> (m, i*j, nbands), all bands in one call
+                    grad_contracted_k[_iA] = np.matmul(
+                        _tB.transpose(0, 2, 1), _wkT).reshape(
+                            self.norbs, self.natoms, 3, nbands)
+                    del _tB
+                # S(k) contracted over cells, for the dipole correction.
+                phase_k_uc = np.exp(Hamcts.JTWOPI*np.sum(self.graph_data.nbr_shift_of_cell*k[None,:], axis=-1))
+                SK_k = np.einsum('n, nij->ij', phase_k_uc, self.graph_data.S_cell)
+                # S(k) enters only through conj(wave_kpq) . S(k) . wave_k^T and both depend
+                # on k alone, so fold wave_k in here rather than per band pair.
+                _Sw_k = SK_k @ wave_k.T # (norbs, nbands)
+                kpq_all = k + q_grid_group                            # (nqs_group, 3)
+                # k+q states and cell phases are evaluated in batches instead of one q at a time:
+                # the diagonalisation is batched over the chunk, only the bands in band_indice are
+                # requested, and the cell phase is built in one call over the cells that survive the
+                # cell cut.  A chunk rather than the whole q subset keeps the batch arrays bounded.
+                for _q_start in range(0, nqs_group, _q_batch):
+                    _q_end = min(_q_start + _q_batch, nqs_group)
+                    eig_kpq_b, wave_kpq_b = self._elec_cal_partial(kpq_all[_q_start:_q_end], band_indice)
+                    phase_kpq_cut_b = np.exp(Hamcts.JTWOPI*np.einsum('qd, nd->qn',
+                                             kpq_all[_q_start:_q_end], nbr_shift_cut)).astype(np.complex128)
+                    for _iq_b in range(_q_end - _q_start):
+                        iq = _q_start + _iq_b
+                        q = q_grid_group[iq]
+                        apply_correction_for_this_q = corr_mask[iq]
                         # phonon spectrum
                         freq = freq_grid[iq]
                         eigen_vec_phon = phon_vecs[iq]
@@ -1902,42 +2654,93 @@ class EPC_calculator(object):
                         phvec_wap = atomic_phase[None,:,None] * eigen_vec_phon # shape (nbranches, natoms, 3)
                         bose_qvs = bose_weight(freq, self.temperature)
                         # calculate the electronic info for k+q
-                        kpq = k + q
-                        eig_kpq, wave_kpq = self._elec_cal(kpq)
-                        eig_kpq = eig_kpq[band_indice, 0]
-                        wave_kpq = wave_kpq[0, band_indice, :]
-                        phase_kpq = np.exp(Hamcts.JTWOPI*np.sum(self.nbr_shift_of_cell_sc*(kpq)[None,:], axis=-1)) # shape: (ncells,)
+                        eig_kpq = eig_kpq_b[:, _iq_b]
+                        wave_kpq = wave_kpq_b[_iq_b]
                         match_table = self._get_match_table(eig_k, eig_kpq, freq)
+                        # Every contribution below is gated by the match table, so when it
+                        # selects nothing for this (k, q) the cell contraction and the
+                        # band/branch contractions are skipped altogether.  The energy
+                        # window makes this the common case.
+                        if not np.any(match_table[~skip_mask]):
+                            continue
                         fermi_kpqs = fermi_weight(eig_kpq - self.efermi, self.temperature)
                         # cal epc
-                        for jbnd in range(nbands):
-                            tmp1 = np.einsum('m,n -> mn', np.conj(wave_kpq[jbnd]), wave_k[ibnd])
-                            for imode in range(nmodes):
-                                if match_table[ibnd, jbnd, imode]:
-                                    factor = 1.0 / np.sqrt(2.0 * self.atomic_mass * abs(freq[imode])) # shape:(natoms,)
-                                    tmp2 = np.einsum('ij,mn -> mnij', factor[:,None]*phvec_wap[imode], tmp1)
-                                    epc = 0.0
-                                    for i_m, m in enumerate(self.cell_cut_list): # ncells
-                                        for i_n, n in enumerate(self.cell_cut_list): # ncells  
-                                            epc += np.conj(phase_kpq[m])*phase_k[n]*np.einsum('mnij,mnij', tmp2, self.grad_mat[i_m,i_n])
-                                    # Correction of long-range interactions
-                                    if apply_correction_for_this_q:
-                                        epc_corr = self._dipole_correction(tmp1, k, q, factor, phvec_wap[imode])
-                                        epc = epc + epc_corr
-                                        g2_tmp = np.abs(epc) * np.abs(epc) - np.abs(epc_corr) * np.abs(epc_corr)
-                                    else:
-                                        g2_tmp = np.abs(epc) * np.abs(epc)
-                                    delta_f1 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] + freq[imode]) * self.inv_smearq) * self.inv_smearq
-                                    delta_f2 = w0gauss((eig_k[ibnd] - eig_kpq[jbnd] - freq[imode]) * self.inv_smearq) * self.inv_smearq
-                                    rate_all[ibnd, ik_all] += weights_q_local[iq] * g2_tmp * \
-                                                              ((bose_qvs[imode] + fermi_kpqs[jbnd]) * delta_f1 + \
-                                                               (bose_qvs[imode] + 1.0 - fermi_kpqs[jbnd]) * delta_f2)
-            if self.rank == 0:
-                logger.step(send_rank+1)
+                        grad_ph = np.tensordot(np.conj(phase_kpq_cut_b[_iq_b]),
+                                              grad_contracted_k, axes=([0], [0])) # (m,i,j,nbands)
+                        # Built for every mode at once, so the branches the match table
+                        # discards are formed too; leaving 1/sqrt(0) in them would put an
+                        # inf where the per-element code never evaluates anything.
+                        factor_all = np.zeros((len(freq), len(self.atomic_mass)))
+                        _fv = freq >= self.phonon_cutoff
+                        factor_all[_fv] = 1.0 / np.sqrt(
+                            2.0 * self.atomic_mass[None, :] * np.abs(freq[_fv, None]))
+                        if apply_correction_for_this_q and self._lrc_cacheable:
+                            sum_r_all = np.conj(wave_kpq) @ _Sw_k # (nbands, nbands)
+                            A_qm = A_qm_cache[iq]
+                        for ibnd in range(nbands):
+                            if skip_mask[ibnd]:
+                                continue
+                            # Tested before the contractions below rather than after: the
+                            # energy window makes an empty row the common case.
+                            mt = match_table[ibnd] # (nbands, nmodes)
+                            if not np.any(mt):
+                                continue
+                            grad_partial = grad_ph[..., ibnd] # (norbs, natoms, 3); wave_k already folded in
+                            # grad_elec for ALL jbnd at once: (nbands, natoms, 3)
+                            grad_elec_all = np.einsum('jm, mab -> jab', np.conj(wave_kpq), grad_partial)
+                            # epc for all (jbnd, imode): (nbands, nmodes)
+                            epc_mat = np.einsum('jax, max, ma -> jm', grad_elec_all, phvec_wap, factor_all)
+                            if apply_correction_for_this_q:
+                                if self._lrc_cacheable:
+                                    # epc_corr[j,m] = A_qm[m] * sum_r_all[j, ibnd]
+                                    epc_corr_mat = A_qm[None, :] * sum_r_all[:, ibnd, None] # (nbands, nmodes)
+                                else:
+                                    epc_corr_mat = self._dipole_correction_mat(
+                                        ibnd, wave_k, wave_kpq, k, q, factor_all, phvec_wap, freq)
+                                epc_full = epc_mat + epc_corr_mat
+                                g2_mat = np.abs(epc_full) ** 2 - np.abs(epc_corr_mat) ** 2
+                            else:
+                                g2_mat = np.abs(epc_mat) ** 2 # (nbands, nmodes)
+
+                            de = eig_k[ibnd] - eig_kpq # (nbands,)
+                            d1 = w0gauss((de[:, None] + freq[None, :]) * self.inv_smearq) * self.inv_smearq
+                            d2 = w0gauss((de[:, None] - freq[None, :]) * self.inv_smearq) * self.inv_smearq
+                            bose = bose_qvs[None, :]    # (1, nmodes)
+                            fermi = fermi_kpqs[:, None] # (nbands, 1)
+                            if self.ishole:
+                                # For holes the roles of the emission and absorption
+                                # occupations swap.
+                                contrib = g2_mat * mt * ((bose + 1.0 - fermi) * d1 +
+                                                         (bose + fermi) * d2)
+                            else:
+                                contrib = g2_mat * mt * ((bose + fermi) * d1 +
+                                                         (bose + 1.0 - fermi) * d2)
+                            rate_all[ibnd, ik_all] += weights_q_local[iq] * contrib.sum()
+                    # Counted per q batch rather than per k point: a rank owns only a few
+                    # active k, so a per-k update could not resolve single percent steps.
+                    _work_done += _q_end - _q_start
+                    _decile = int(100 * _work_done / _work_total)
+                    if self.rank == 0 and _decile > _decile_done:
+                        _decile_done = _decile
+                        logger.step(_decile)
+
+        comm_k.Free()
+        k_row_comm.Free()
         rate_all *= Hamcts.TWOPI
-        # The rate_all of the whole q is obtained by allreducing the rate_all of each process
+        # Each rank accumulated its own (k subset) x (q subset); the global Allreduce(SUM)
+        # completes both the q integral and the k gathering at once.  It moves only a few
+        # hundred kB but cannot finish until every rank has arrived, so an imbalanced
+        # workload appears as a long silence after the progress bar reaches 100% -- that bar
+        # tracks rank 0 alone.  The first message without the second therefore means the run
+        # is still waiting for the slowest rank, not that it has deadlocked.
         if self.comm is not None:
+            if self.rank == 0:
+                print('  waiting for all ranks at the rate_all reduction...', flush=True)
+            _t_wait = time.time()
             self.comm.Allreduce(MPI.IN_PLACE, rate_all, op=MPI.SUM)
+            if self.rank == 0:
+                print('  reduction done after waiting {:.0f}s for the slowest rank.'.format(
+                    time.time() - _t_wait), flush=True)
         return rate_all
 
     def mobility_cal(self):
@@ -1965,9 +2768,25 @@ class EPC_calculator(object):
             band_edge_index = self.CBM_band_index
         iband_edge = np.where(np.array(self.bands_indices)==band_edge_index)[0][0]
         
-        enks, _ = self._elec_cal(k_grid) # (nbandtots, nk)
-        enks = enks[self.bands_indices, :] # (nbnd, nk)
-        
+        # The band energies on the irreducible k grid are needed by every rank, but the
+        # diagonalisation is embarrassingly parallel: split the k points, diagonalise the
+        # local chunk and allgather the (small) eigenvalue array.
+        if self.comm is not None and self.rank_size > 1:
+            nk = len(k_grid)
+            counts = [nk // self.rank_size + (1 if i < nk % self.rank_size else 0)
+                      for i in range(self.rank_size)]
+            offsets = [sum(counts[:i]) for i in range(self.rank_size)]
+            k_grid_local = k_grid[offsets[self.rank]:offsets[self.rank] + counts[self.rank]]
+            if len(k_grid_local) > 0:
+                enks_local, _ = self._elec_cal(k_grid_local)
+                enks_local = enks_local[self.bands_indices, :]
+            else:
+                enks_local = np.empty((len(self.bands_indices), 0))
+            enks = np.concatenate(self.comm.allgather(enks_local), axis=1) # (nbnd, nks)
+        else:
+            enks, _ = self._elec_cal(k_grid) # (nbandtots, nk)
+            enks = enks[self.bands_indices, :] # (nbnd, nk)
+
         # carrier_density has been multiplied by unit cell volume
         self.efermi, self.carrier_density = self._get_fermi_level_insulator(enks, iband_edge)
         if self.rank == 0:
@@ -1985,9 +2804,15 @@ class EPC_calculator(object):
         split_sections = np.cumsum(split_sections, axis=0)
         grid_all = np.split(grid_all, indices_or_sections=split_sections, axis=0)
         
-        if grid_all[self.rank].size>0:
+        # _get_ir_reciprocal_mesh hands back the raw integer mesh; scale and rotate only
+        # this rank's slice so no full-mesh float64 copy is ever materialised.
+        _grid_mine = grid_all[self.rank]
+        _n_grid_mine = len(_grid_mine)
+        if _n_grid_mine > 0:
+            _grid_mine = np.tensordot(_grid_mine / np.array(self.k_size, dtype=float),
+                                      self.graph_data.lat_per_inv, axes=1)
             # calculate the electron velocity in parallel
-            elec_velocities = self.vel_nk_cal_from_HS(self.bands_indices, grid_all[self.rank]) # (nk_split, nbands, 3)
+            elec_velocities = self.vel_nk_cal_from_HS(self.bands_indices, _grid_mine) # (nk_split, nbands, 3)
         else:
             elec_velocities = np.empty((0, len(self.bands_indices), 3))
 
@@ -2064,7 +2889,7 @@ class EPC_calculator(object):
         enks_all = np.split(enks[:, grid2ir_idx], indices_or_sections=split_sections, axis=-1)
         enks_rank = enks_all[self.rank]
         
-        if grid_all[self.rank].size>0:
+        if _n_grid_mine > 0:
             mdf = minus_dfermi(enks_rank - self.efermi, self.temperature)
             sigma_mat = oe.contract('nk, kni, knj, nk->ij', mdf, elec_velocities, elec_velocities, 1.0 / rate_rank) # shape: (3, 3)
         else:
