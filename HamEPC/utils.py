@@ -555,6 +555,122 @@ basis_def_19_siesta = (lambda s1=[0],s2=[1],s3=[2],p1=[3,4,5],p2=[6,7,8],d1=[9,1
 
 num_valence_openmx = {1:1,2:2,3:3,4:2,5:3,6:4,7:5,8:6,9:7,10:8,11:9,12:8,13:3,14:4,15:5,16:6,17:7,18:8,19:9,20:10,42:14,83:15,34:6,
                35:7,55:9,82:14,53:7,33:15,80:18,31:13,Element['V'].Z:13,Element['Sb'].Z:15, Element['Ge'].Z:4}
+
+basis_def_26 = (lambda s1=[0],s2=[1],s3=[2],p1=[3,4,5],p2=[6,7,8],d1=[9,10,11,12,13],d2=[14,15,16,17,18],f1=[19,20,21,22,23,24,25]: {
+    Element['H'].Z : np.array(s1+s2+p1, dtype=int), # H6.0-s2p1
+    Element['He'].Z : np.array(s1+s2+p1, dtype=int), # He8.0-s2p1
+    Element['Li'].Z : np.array(s1+s2+s3+p1+p2, dtype=int), # Li8.0-s3p2
+    Element['Be'].Z : np.array(s1+s2+p1+p2, dtype=int), # Be7.0-s2p2
+    Element['B'].Z : np.array(s1+s2+p1+p2+d1, dtype=int), # B7.0-s2p2d1
+    Element['C'].Z : np.array(s1+s2+p1+p2+d1, dtype=int), # C6.0-s2p2d1
+    Element['N'].Z : np.array(s1+s2+p1+p2+d1, dtype=int), # N6.0-s2p2d1
+    Element['O'].Z : np.array(s1+s2+p1+p2+d1, dtype=int), # O6.0-s2p2d1
+    Element['F'].Z : np.array(s1+s2+p1+p2+d1, dtype=int), # F6.0-s2p2d1
+    Element['Ne'].Z: np.array(s1+s2+p1+p2+d1, dtype=int), # Ne9.0-s2p2d1
+    Element['Na'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Na9.0-s3p2d1
+    Element['Mg'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Mg9.0-s3p2d1
+    Element['Al'].Z: np.array(s1+s2+p1+p2+d1, dtype=int), # Al7.0-s2p2d1
+    Element['Si'].Z: np.array(s1+s2+p1+p2+d1, dtype=int), # Si7.0-s2p2d1
+    Element['P'].Z: np.array(s1+s2+p1+p2+d1, dtype=int), # P7.0-s2p2d1
+    Element['S'].Z: np.array(s1+s2+p1+p2+d1, dtype=int), # S7.0-s2p2d1
+    Element['Cl'].Z: np.array(s1+s2+p1+p2+d1, dtype=int), # Cl7.0-s2p2d1
+    Element['Ar'].Z: np.array(s1+s2+p1+p2+d1, dtype=int), # Ar9.0-s2p2d1
+    Element['K'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # K10.0-s3p2d1
+    Element['Ca'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Ca9.0-s3p2d1
+    Element['Sc'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Sc9.0-s3p2d1
+    Element['Ti'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Ti7.0-s3p2d1
+    Element['V'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # V6.0-s3p2d1
+    Element['Cr'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Cr6.0-s3p2d1
+    Element['Mn'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Mn6.0-s3p2d1
+    Element['Fe'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Fe5.5H-s3p2d1
+    Element['Co'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Co6.0H-s3p2d1
+    Element['Ni'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Ni6.0H-s3p2d1
+    Element['Cu'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Cu6.0H-s3p2d1
+    Element['Zn'].Z: np.array(s1+s2+s3+p1+p2+d1, dtype=int), # Zn6.0H-s3p2d1
+    Element['Ga'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Ga7.0-s3p2d2
+    Element['Ge'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Ge7.0-s3p2d2
+    Element['As'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # As7.0-s3p2d2
+    Element['Se'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Se7.0-s3p2d2
+    Element['Br'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Br7.0-s3p2d2
+    Element['Kr'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Kr10.0-s3p2d2
+    Element['Rb'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Rb11.0-s3p2d2
+    Element['Sr'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Sr10.0-s3p2d2
+    Element['Y'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Y10.0-s3p2d2
+    Element['Zr'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Zr7.0-s3p2d2
+    Element['Nb'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Nb7.0-s3p2d2
+    Element['Mo'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Mo7.0-s3p2d2
+    Element['Tc'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Tc7.0-s3p2d2
+    Element['Ru'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Ru7.0-s3p2d2
+    Element['Rh'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Rh7.0-s3p2d2
+    Element['Pd'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Pd7.0-s3p2d2
+    Element['Ag'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Ag7.0-s3p2d2
+    Element['Cd'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Cd7.0-s3p2d2
+    Element['In'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # In7.0-s3p2d2
+    Element['Sn'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Sn7.0-s3p2d2
+    Element['Sb'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Sb7.0-s3p2d2
+    Element['Te'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Te7.0-s3p2d2f1
+    Element['I'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # I7.0-s3p2d2f1
+    Element['Xe'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Xe11.0-s3p2d2
+    Element['Cs'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Cs12.0-s3p2d2
+    Element['Ba'].Z: np.array(s1+s2+s3+p1+p2+d1+d2, dtype=int), # Ba10.0-s3p2d2
+    Element['La'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # La8.0-s3p2d2f1
+    Element['Ce'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Ce8.0-s3p2d2f1
+    Element['Pr'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Pr8.0-s3p2d2f1
+    Element['Nd'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Nd8.0-s3p2d2f1
+    Element['Pm'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Pm8.0-s3p2d2f1
+    Element['Sm'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Sm8.0-s3p2d2f1
+    Element['Dy'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Dy8.0-s3p2d2f1
+    Element['Ho'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Ho8.0-s3p2d2f1
+    Element['Lu'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Lu8.0-s3p2d2f1
+    Element['Hf'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Hf9.0-s3p2d2f1
+    Element['Ta'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Ta7.0-s3p2d2f1
+    Element['W'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # W7.0-s3p2d2f1
+    Element['Re'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Re7.0-s3p2d2f1
+    Element['Os'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Os7.0-s3p2d2f1
+    Element['Ir'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Ir7.0-s3p2d2f1
+    Element['Pt'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Pt7.0-s3p2d2f1
+    Element['Au'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Au7.0-s3p2d2f1
+    Element['Hg'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Hg8.0-s3p2d2f1
+    Element['Tl'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Tl8.0-s3p2d2f1
+    Element['Pb'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Pb8.0-s3p2d2f1
+    Element['Bi'].Z: np.array(s1+s2+s3+p1+p2+d1+d2+f1, dtype=int), # Bi8.0-s3p2d2f1 
+})()
+
+basis_def_19 = {
+             1:np.array([0,1,3,4,5], dtype=int), # H
+             2:np.array([0,1,3,4,5], dtype=int), # He
+             3:np.array([0,1,2,3,4,5,6,7,8], dtype=int), # Li
+             4:np.array([0,1,3,4,5,6,7,8], dtype=int), # Be
+             5:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # B
+             6:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # C
+             7:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # N
+             8:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # O
+             9:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # F
+             10:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Ne
+             11:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Na
+             12:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Mg
+             13:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Al
+             14:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Si
+             15:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # p
+             16:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # S
+             17:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Cl
+             18:np.array([0,1,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Ar
+             19:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # K
+             20:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Ca 
+             42:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # Mo  
+             83:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # Bi  
+             34:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # Se 
+             24:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # Cr 
+             53:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # I   
+             82:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # pb
+             55:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # Cs
+             31:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # Ga
+             33:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # As
+             80:np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # Hg
+             Element['V'].Z: np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13], dtype=int), # V
+             Element['Sb'].Z: np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # Sb
+             Element['Ge'].Z: np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], dtype=int), # Sb
+             }
 num_val_openmx = np.zeros((99,), dtype=int)
 for k in num_valence_openmx.keys():
     num_val_openmx[k] = num_valence_openmx[k]
@@ -724,6 +840,8 @@ def build_sparse_matrix_soc(species, cell_shift, nao_max, Hon, Hoff, iHon, iHoff
                 basis_def = basis_def_14
             elif nao_max == 19:
                 basis_def = basis_def_19
+            elif nao_max == 26:
+                basis_def = basis_def_26
             else:
                 raise NotImplementedError
         elif Ham_type.lower() in ['siesta', 'honpas']:
@@ -798,6 +916,8 @@ def build_sparse_matrix(species, cell_shift, nao_max, Hon, Hoff, edge_index, Ham
                 basis_def = basis_def_14
             elif nao_max == 19:
                 basis_def = basis_def_19
+            elif nao_max == 26:
+                basis_def = basis_def_26
             else:
                 raise NotImplementedError
         elif Ham_type.lower() in ['siesta', 'honpas']:
@@ -922,6 +1042,8 @@ def get_orb2atomidx(nao_max, species, Ham_type:str='openmx'):
             basis_def = basis_def_14
         elif nao_max == 19:
             basis_def = basis_def_19
+        elif nao_max == 26:
+            basis_def = basis_def_26
         else:
             raise NotImplementedError
     elif Ham_type.lower() in ['siesta', 'honpas']:
