@@ -1025,7 +1025,11 @@ class EPC_calculator(object):
                     rel_err = -Hamcts.TENPP3
                 else:
                     rel_err = (hole_density - np.abs(self.ncarrier)) / hole_density
-                if rel_err < Hamcts.TENPM5:
+                # Tested on the magnitude, as the electron branch below does.  The
+                # underflow case sets rel_err negative to mean "too few holes, raise ef",
+                # and a bare rel_err < TENPM5 would read that as convergence and break on
+                # the first iteration, leaving ef at its starting value.
+                if np.abs(rel_err) < Hamcts.TENPM5:
                     efermi = evbm - (np.log(ef) * self.temperature)
                     break
                 elif rel_err > Hamcts.TENPM5:
@@ -1618,8 +1622,8 @@ class EPC_calculator(object):
             all_eigens = k_row_comm.bcast(all_eigens, root=0)
 
         # Mark the k points outside the energy window and keep only the active ones.
-        rate_all[all_eigens > efocus_max] = np.inf
-        active_k_mask = np.any(all_eigens <= efocus_max, axis=0)
+        rate_all[(all_eigens > efocus_max) | (all_eigens < efocus_min)] = np.inf
+        active_k_mask = np.any((all_eigens <= efocus_max) & (all_eigens >= efocus_min), axis=0)
         active_k_indices = np.where(active_k_mask)[0]
         n_active = len(active_k_indices)
         if self.rank == 0:
@@ -2193,8 +2197,8 @@ class EPC_calculator(object):
             self.comm.allgather(np.ascontiguousarray(eigen_local, dtype=np.float64)), axis=1) # (nbands, nks)
 
         # Mark the k points outside the energy window and keep only the active ones.
-        rate_all[all_eigens > efocus_max] = np.inf
-        active_k_mask = np.any(all_eigens <= efocus_max, axis=0)
+        rate_all[(all_eigens > efocus_max) | (all_eigens < efocus_min)] = np.inf
+        active_k_mask = np.any((all_eigens <= efocus_max) & (all_eigens >= efocus_min), axis=0)
         active_k_indices = np.where(active_k_mask)[0]
         n_active = len(active_k_indices)
         if self.rank == 0:
@@ -2495,8 +2499,8 @@ class EPC_calculator(object):
             all_eigens = k_row_comm.bcast(all_eigens, root=0)
 
         # Mark the k points outside the energy window and keep only the active ones.
-        rate_all[all_eigens > efocus_max] = np.inf
-        active_k_mask = np.any(all_eigens <= efocus_max, axis=0)
+        rate_all[(all_eigens > efocus_max) | (all_eigens < efocus_min)] = np.inf
+        active_k_mask = np.any((all_eigens <= efocus_max) & (all_eigens >= efocus_min), axis=0)
         active_k_indices = np.where(active_k_mask)[0]
         n_active = len(active_k_indices)
         if self.rank == 0:
@@ -2794,8 +2798,13 @@ class EPC_calculator(object):
                 self.efermi * Hamcts.HARTREEtoEV, self.carrier_density * self.inv_cell / (Hamcts.BOHRtoCM ** 3)
                 ))
             
-        ecbm = self._get_ecbm(enks, iband_edge)
-        
+        # The band edge the window is measured from: the CBM for electrons, the VBM for
+        # holes.  The scattering routines take it as `ecbm` either way.
+        if self.ishole:
+            ecbm = self._get_evbm(enks, iband_edge)
+        else:
+            ecbm = self._get_ecbm(enks, iband_edge)
+
         # k points are parallelized and k grid is split
         split_sections = np.zeros(self.rank_size, dtype=int)
         for i in range(len(grid_all)):
