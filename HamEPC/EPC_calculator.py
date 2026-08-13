@@ -1013,8 +1013,13 @@ class EPC_calculator(object):
             # so the values kept are the same as those the element-wise loop produced.
             args_hole = (enks - evbm) / self.temperature
             ks_exp = np.where(args_hole < -self.maxarg, 0.0, np.exp(args_hole))
-            eup = Hamcts.TENPM160
-            elw = 1.0
+            # ef sets the Fermi level through efermi = evbm - log(ef) * T, so ef below
+            # one puts it above the VBM (dilute holes, Fermi level in the gap) and ef
+            # above one puts it below (degenerate holes, Fermi level inside the valence
+            # bands).  Bracketing at an upper bound of one therefore excludes the
+            # degenerate case entirely; bracket symmetrically instead.
+            eup = Hamcts.TENPM80
+            elw = Hamcts.TENPP80
             for i in range(self.fermi_maxiter):
                 ef = np.sqrt(eup) * np.sqrt(elw)
                 _kse = ks_exp[:iband_edge+1] * ef
