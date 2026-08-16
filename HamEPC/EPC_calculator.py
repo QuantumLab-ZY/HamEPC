@@ -586,17 +586,48 @@ class EPC_calculator(object):
             del grid
             return k_vec, weight
 
-    def _phonon_cal(self, q_grid):
+    def _phonon_cal(self, q_grid, connect_branches:bool=False):
+        """Phonon frequencies and eigenvectors on a set of q points.
+
+        With connect_branches set, the branches are relabelled so that one branch
+        index follows one physical branch along the list of q points.  The
+        diagonalisation orders modes by frequency at each q independently, so at a
+        crossing the two branches involved swap indices and a fixed index no longer
+        tracks a single branch -- which is what a dispersion plotted per index shows.
+
+        The relabelling matches each q point against the previous one by solving an
+        assignment problem.  Modes that continue the same branch have nearly parallel
+        eigenvectors, so their overlap carries most of the cost, and the frequency
+        difference breaks near-ties inside a degenerate subspace, where the
+        eigenvectors themselves are arbitrary.
+
+        The labelling is relative to the first q point, which has nothing to match
+        against and keeps the order the diagonalisation gave it.  Where that point
+        is degenerate the eigenvectors within each degenerate subspace are arbitrary,
+        so the whole path inherits an arbitrary basis: a path is better started from
+        an end with little degeneracy than from one with a lot of it.
+        """
         freq_grid = []
         phon_vecs = []
         q_grid = q_grid.reshape(-1, 3)
-        for q in q_grid:
+        prev_freq = None
+        prev_eigvecs = None
+        for iq, q in enumerate(q_grid):
             dynmat = self.phonon.get_dynamical_matrix_at_q(q)
             eigvals, eigvecs = np.linalg.eigh(dynmat)
             eigvecs = eigvecs.T # shape: (nbranches, nbranches)
             
             freq = np.sqrt(np.abs(eigvals.real)) * np.sign(eigvals.real) # shape: (nbranches,)
             # eigen_vec_phon = eigvecs.reshape(-1, natoms, 3) # shape: (nbranches, natoms, 3)
+
+            if connect_branches:
+                if prev_freq is not None:
+                    order = self._match_phonon_branches(prev_freq, prev_eigvecs,
+                                                        freq, eigvecs)
+                    freq = freq[order]
+                    eigvecs = eigvecs[order]
+                prev_freq, prev_eigvecs = freq, eigvecs
+
             freq_grid.append(freq)
             phon_vecs.append(eigvecs)
 
@@ -604,6 +635,36 @@ class EPC_calculator(object):
         phon_vecs= np.stack(phon_vecs, axis=0) # shape: (nq, nbranches, nbranches)
         
         return freq_grid, phon_vecs
+
+    def _match_phonon_branches(self, prev_freq, prev_vecs, curr_freq, curr_vecs):
+        """Permutation of the current modes that continues the previous branches.
+
+        The eigenvector overlap decides.  A symmetry label would additionally rule
+        out pairings between modes of different irreducible representations, but
+        the little group along a line is smaller than the one at its end points
+        and its operations differ, so labels taken at neighbouring q points are
+        not comparable without subducing them to a common subgroup.
+        """
+        from scipy.optimize import linear_sum_assignment
+
+        # Modes continuing one branch stay nearly parallel.
+        overlap = np.abs(np.dot(prev_vecs.conjugate(), curr_vecs.T))
+
+        # Solved exactly, by the Hungarian algorithm: a greedy pass would let two
+        # branches claim the same partner where several of them meet at once, and
+        # the result would no longer be a permutation.
+
+        # Frequency difference, normalised, as a tie-breaker: within a degenerate
+        # subspace the eigenvectors are arbitrary and the overlap cannot separate
+        # the modes on its own.
+        freq_diff = np.abs(prev_freq[:, None] - curr_freq[None, :])
+        max_diff = np.max(freq_diff)
+        if max_diff <= Hamcts.TENPM5:
+            max_diff = 1.0
+
+        cost = (1.0 - overlap) + (freq_diff / max_diff) * 0.1
+        _, order = linear_sum_assignment(cost)
+        return order
 
     def _elec_cal(self, k_grid):
         # Calculate the electron wave function
@@ -691,7 +752,8 @@ class EPC_calculator(object):
 
         return eigen, eigen_vecs
 
-    def EPC_cal_path(self, k_fix, q_paths, band_ini, band_fin, do_symm:bool=True):
+    def EPC_cal_path(self, k_fix, q_paths, band_ini, band_fin, do_symm:bool=True,
+                     return_freq:bool=False):
         """
         Args:
             k_fix (list or np.ndarray): (3)
@@ -699,12 +761,17 @@ class EPC_calculator(object):
             band_ini (int): The band index of initial state, begin from 0.
             band_fin (int): The band index of final state, begin from 0.
             do_symm (bool): If True, do the average over degenerate state.
+            return_freq (bool): If True, also return the phonon frequencies the
+                coupling was evaluated at, in the same (nq, nbranches) layout.
 
         Returns:
             epc_all (np.ndarray): # shape:(nq, nbranches) EPC in Hartree.
+            freq_grid (np.ndarray): # shape:(nq, nbranches), only if return_freq.
         """
         # calculate the phonon spectrum
-        freq_grid, phon_vecs = self._phonon_cal(q_paths)
+        # This walks a q path, so relabel the branches to follow physical ones:
+        # otherwise a fixed branch index swaps branches wherever two of them cross.
+        freq_grid, phon_vecs = self._phonon_cal(q_paths, connect_branches=True)
         k_fix = self._frac2car(np.array([k_fix]))[0]
         q_paths = self._frac2car(q_paths)
         epc_all = []
@@ -756,6 +823,8 @@ class EPC_calculator(object):
         epc_all = np.array(epc_all).reshape(len(q_paths), int(3*len(self.atomic_mass)))
         if do_symm:
             self._EPC_symmetrize(epc_all, freq_grid, is_path=True)
+        if return_freq:
+            return epc_all, freq_grid
         return epc_all
 
     def _EPC_symmetrize(self, epc_all, freqs, is_path:bool=False):
@@ -3059,17 +3128,23 @@ class EPC_calculator(object):
 
         Returns:
         """
-        epcs = np.abs(self.EPC_cal_path(self.epc_path_fix_k, self.high_symmetry_k_vecs, 
-                                                    self.dispersion_select_index[0], self.dispersion_select_index[1],
-                                                    do_symm=False)) # shape: (nqs, nmodes)
-        epcs = epcs * Hamcts.HARTREEtoMEV
+        epcs, freqs = self.EPC_cal_path(self.epc_path_fix_k, self.high_symmetry_k_vecs,
+                                        self.dispersion_select_index[0], self.dispersion_select_index[1],
+                                        do_symm=False, return_freq=True) # shape: (nqs, nmodes)
+        epcs = np.abs(epcs) * Hamcts.HARTREEtoMEV
+        # Written beside the coupling: a branch index alone does not name a mode to a
+        # reader, and the frequency also confirms two runs walked the same q path.
+        freqs = freqs * Hamcts.HARTREEtoMEV
         nqs, nmodes = epcs.shape
         fout = open(os.path.join(self.outdir, "epc.dispersion"), 'w')
         fout.write(f"# k_lable: {' '.join(self.high_symmetry_labels)}\n")
         fout.write(f"# k_node: { '  '.join([str(round(each, 10)) for each in self.high_symmetry_k_nodes]) }\n")
+        fout.write("# Format: q_distance(Bohr^-1)  Frequency(meV)  |g|(meV)\n")
         for imode in range(nmodes):
             for iq in range(nqs):
-                fout.write(f"{str(round(self.high_symmetry_k_dist[iq], 10))}    {str(round(epcs[iq, imode], 10))}\n")
+                fout.write(f"{str(round(self.high_symmetry_k_dist[iq], 10))}  "
+                           f"{str(round(freqs[iq, imode], 10))}  "
+                           f"{str(round(epcs[iq, imode], 10))}\n")
             fout.write('\n')
         fout.close()
 
