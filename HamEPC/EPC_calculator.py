@@ -727,18 +727,27 @@ class EPC_calculator(object):
 
             tmp1 = np.einsum('m,n -> mn', np.conj(wave_coe2), wave_coe1)
             # calculate epc
+            #
+            # The sum over cell pairs carries no branch index, so it is taken once per q
+            # rather than once per (q, branch): the two cell phases become an outer
+            # product that contracts the gradient tensor over both cell axes, and the
+            # electronic overlap then reduces what is left to the displaced-atom and
+            # Cartesian axes.  Every branch is finally contracted in one einsum.
+            _phase_kpq_cut = np.conj(phase_kpq[self.cell_cut_list]).astype(np.complex128)
+            _phase_k_cut = phase_k[self.cell_cut_list].astype(np.complex128)
+            phase_mat = np.outer(_phase_kpq_cut, _phase_k_cut) # (ncells_cut, ncells_cut)
+            grad_ph = np.einsum('AB, ABmnij -> mnij', phase_mat, self.grad_mat)
+            epc_elec = np.einsum('mn, mnij -> ij', tmp1, grad_ph) # (natoms, 3)
+            factor_all = 1.0 / np.sqrt(2.0 * self.atomic_mass[None, :] * freq[:, None])
+            epc_branch = np.einsum('ij, vij, vi -> v', epc_elec, phvec_wap, factor_all)
+
             for branch_idx in range(int(3*len(self.atomic_mass))):
-                factor = 1.0 / np.sqrt(2.0 * self.atomic_mass * freq[branch_idx]) # shape:(natoms,)
-                tmp2 = np.einsum('ij,mn -> mnij', factor[:,None]*phvec_wap[branch_idx], tmp1)
-                
-                epc = 0.0
-                for i_m, m in enumerate(self.cell_cut_list): # ncells
-                    for i_n, n in enumerate(self.cell_cut_list): # ncells 
-                        epc += np.conj(phase_kpq[m])*phase_k[n]*np.einsum('mnij,mnij', tmp2, self.grad_mat[i_m,i_n])
+                epc = epc_branch[branch_idx]
 
                 # Correction of long-range interactions
                 if self.apply_correction and (np.linalg.norm(q) < self.q_cut):
-                    epc_corr = self._dipole_correction(tmp1, k_fix, q, factor, phvec_wap[branch_idx])
+                    epc_corr = self._dipole_correction(tmp1, k_fix, q, factor_all[branch_idx],
+                                                       phvec_wap[branch_idx])
                 else:
                     epc_corr = 0.0
                 epc_all.append(epc + epc_corr)
