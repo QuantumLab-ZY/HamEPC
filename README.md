@@ -321,6 +321,11 @@ To use this program, you should first set all the parameters in the basic block 
 
     + options:&nbsp; &nbsp; *LIST[FLOAT]*
 
+When `calc_mode = 'epc'`, `epc.dispersion` keeps the legacy two-column format
+`q_distance |g|` in meV. The additional `epc.dispersion.with_freq` file contains
+`q_distance Frequency |g|`, also in meV, so the tracked phonon frequency can be
+checked alongside each coupling branch.
+
 ### `phonon`:
 
 + `supercell_matrix`:

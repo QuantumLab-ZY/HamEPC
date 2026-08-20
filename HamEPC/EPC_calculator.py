@@ -617,8 +617,8 @@ class EPC_calculator(object):
             eigvals, eigvecs = np.linalg.eigh(dynmat)
             eigvecs = eigvecs.T # shape: (nbranches, nbranches)
             
-            freq = np.sqrt(np.abs(eigvals.real)) * np.sign(eigvals.real) # shape: (nbranches,)
-            # eigen_vec_phon = eigvecs.reshape(-1, natoms, 3) # shape: (nbranches, natoms, 3)
+            freq = (np.sqrt(np.abs(eigvals.real)) * np.sign(eigvals.real)
+                    * Hamcts.PHONOPYtoHARTREE)
 
             if connect_branches:
                 if prev_freq is not None:
@@ -631,40 +631,73 @@ class EPC_calculator(object):
             freq_grid.append(freq)
             phon_vecs.append(eigvecs)
 
-        freq_grid = np.stack(freq_grid, axis=0) * Hamcts.PHONOPYtoHARTREE # shape: (nq, nbranches)
-        phon_vecs= np.stack(phon_vecs, axis=0) # shape: (nq, nbranches, nbranches)
+        freq_grid = np.stack(freq_grid, axis=0) # shape: (nq, nbranches), Hartree
+        phon_vecs = np.stack(phon_vecs, axis=0) # shape: (nq, nbranches, nbranches)
         
         return freq_grid, phon_vecs
 
     def _match_phonon_branches(self, prev_freq, prev_vecs, curr_freq, curr_vecs):
-        """Permutation of the current modes that continues the previous branches.
-
-        The eigenvector overlap decides.  A symmetry label would additionally rule
-        out pairings between modes of different irreducible representations, but
-        the little group along a line is smaller than the one at its end points
-        and its operations differ, so labels taken at neighbouring q points are
-        not comparable without subducing them to a common subgroup.
-        """
+        """Permutation of the current modes that continues the previous branches."""
         from scipy.optimize import linear_sum_assignment
 
-        # Modes continuing one branch stay nearly parallel.
+        prev_vecs, curr_vecs = self._align_degenerate_subspaces(
+            prev_freq, prev_vecs, curr_freq, curr_vecs)
         overlap = np.abs(np.dot(prev_vecs.conjugate(), curr_vecs.T))
-
-        # Solved exactly, by the Hungarian algorithm: a greedy pass would let two
-        # branches claim the same partner where several of them meet at once, and
-        # the result would no longer be a permutation.
-
-        # Frequency difference, normalised, as a tie-breaker: within a degenerate
-        # subspace the eigenvectors are arbitrary and the overlap cannot separate
-        # the modes on its own.
         freq_diff = np.abs(prev_freq[:, None] - curr_freq[None, :])
-        max_diff = np.max(freq_diff)
-        if max_diff <= Hamcts.TENPM5:
-            max_diff = 1.0
-
-        cost = (1.0 - overlap) + (freq_diff / max_diff) * 0.1
+        freq_scale = np.maximum(
+            np.maximum(np.abs(prev_freq[:, None]), np.abs(curr_freq[None, :])),
+            Hamcts.TENPM5)
+        cost = (1.0 - overlap) + 0.1 * freq_diff / freq_scale
         _, order = linear_sum_assignment(cost)
         return order
+
+    def _align_degenerate_subspaces(self, prev_freq, prev_vecs, curr_freq, curr_vecs):
+        tolerance = Hamcts.TENPM5 + 1.0e-6 * np.maximum(
+            np.maximum(np.abs(prev_freq), np.abs(curr_freq)), 1.0)
+        prev_groups = self._frequency_groups(prev_freq, tolerance)
+        curr_groups = self._frequency_groups(curr_freq, tolerance)
+        if len(prev_groups) != len(curr_groups):
+            return prev_vecs, curr_vecs
+
+        aligned = curr_vecs.copy()
+        unmatched = set(range(len(curr_groups)))
+        for prev_group in prev_groups:
+            candidates = [index for index in unmatched
+                          if len(curr_groups[index]) == len(prev_group)]
+            if not candidates:
+                continue
+            curr_index = min(
+                candidates,
+                key=lambda index: abs(np.mean(prev_freq[prev_group])
+                                      - np.mean(curr_freq[curr_groups[index]])))
+            curr_group = curr_groups[curr_index]
+            if len(prev_group) == 1:
+                unmatched.remove(curr_index)
+                continue
+            if abs(np.mean(prev_freq[prev_group]) - np.mean(curr_freq[curr_group])) > np.max(tolerance):
+                continue
+            prev_subspace = prev_vecs[prev_group]
+            curr_subspace = aligned[curr_group]
+            overlap = np.dot(prev_subspace.conjugate(), curr_subspace.T)
+            left, _, right = np.linalg.svd(overlap)
+            rotation = left @ right
+            aligned[curr_group] = np.dot(rotation, curr_subspace)
+            unmatched.remove(curr_index)
+        return prev_vecs, aligned
+
+    @staticmethod
+    def _frequency_groups(freqs, tolerance):
+        order = np.argsort(freqs)
+        groups = []
+        start = 0
+        for index in range(1, len(order)):
+            left = order[index - 1]
+            right = order[index]
+            if abs(freqs[right] - freqs[left]) > max(tolerance[left], tolerance[right]):
+                groups.append(order[start:index])
+                start = index
+        groups.append(order[start:])
+        return groups
 
     def _elec_cal(self, k_grid):
         # Calculate the electron wave function
@@ -766,7 +799,7 @@ class EPC_calculator(object):
 
         Returns:
             epc_all (np.ndarray): # shape:(nq, nbranches) EPC in Hartree.
-            freq_grid (np.ndarray): # shape:(nq, nbranches), only if return_freq.
+            freq_grid (np.ndarray): # shape:(nq, nbranches), Hartree, only if return_freq.
         """
         # calculate the phonon spectrum
         # This walks a q path, so relabel the branches to follow physical ones:
@@ -3130,23 +3163,28 @@ class EPC_calculator(object):
         """
         epcs, freqs = self.EPC_cal_path(self.epc_path_fix_k, self.high_symmetry_k_vecs,
                                         self.dispersion_select_index[0], self.dispersion_select_index[1],
-                                        do_symm=False, return_freq=True) # shape: (nqs, nmodes)
+                                        do_symm=False, return_freq=True)
         epcs = np.abs(epcs) * Hamcts.HARTREEtoMEV
-        # Written beside the coupling: a branch index alone does not name a mode to a
-        # reader, and the frequency also confirms two runs walked the same q path.
         freqs = freqs * Hamcts.HARTREEtoMEV
         nqs, nmodes = epcs.shape
-        fout = open(os.path.join(self.outdir, "epc.dispersion"), 'w')
-        fout.write(f"# k_lable: {' '.join(self.high_symmetry_labels)}\n")
-        fout.write(f"# k_node: { '  '.join([str(round(each, 10)) for each in self.high_symmetry_k_nodes]) }\n")
-        fout.write("# Format: q_distance(Bohr^-1)  Frequency(meV)  |g|(meV)\n")
-        for imode in range(nmodes):
-            for iq in range(nqs):
-                fout.write(f"{str(round(self.high_symmetry_k_dist[iq], 10))}  "
-                           f"{str(round(freqs[iq, imode], 10))}  "
-                           f"{str(round(epcs[iq, imode], 10))}\n")
-            fout.write('\n')
-        fout.close()
+        header = (f"# k_lable: {' '.join(self.high_symmetry_labels)}\n"
+                  f"# k_node: { '  '.join([str(round(each, 10)) for each in self.high_symmetry_k_nodes]) }\n")
+        with open(os.path.join(self.outdir, "epc.dispersion"), 'w') as fout:
+            fout.write(header)
+            for imode in range(nmodes):
+                for iq in range(nqs):
+                    fout.write(f"{str(round(self.high_symmetry_k_dist[iq], 10))}    "
+                               f"{str(round(epcs[iq, imode], 10))}\n")
+                fout.write('\n')
+        with open(os.path.join(self.outdir, "epc.dispersion.with_freq"), 'w') as fout:
+            fout.write(header)
+            fout.write("# Format: q_distance(Bohr^-1)  Frequency(meV)  |g|(meV)\n")
+            for imode in range(nmodes):
+                for iq in range(nqs):
+                    fout.write(f"{str(round(self.high_symmetry_k_dist[iq], 10))}  "
+                               f"{str(round(freqs[iq, imode], 10))}  "
+                               f"{str(round(epcs[iq, imode], 10))}\n")
+                fout.write('\n')
 
     def plot_phdos(self, q_dim, emin:float=0.0, emax:float=0.0, estep:float=0.01):
         q_grid = self._get_monkhorst_pack(q_dim, return_frac=True)

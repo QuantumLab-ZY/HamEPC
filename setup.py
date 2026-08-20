@@ -20,6 +20,7 @@ setup(
         "torch_geometric",
         "e3nn",
         "pymatgen",
+        "scipy",
         "tqdm",
         "natsort",
         'pyyaml',
