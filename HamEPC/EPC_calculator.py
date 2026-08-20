@@ -2140,6 +2140,8 @@ class EPC_calculator(object):
         nks = len(k_grid)
         nqs = len(q_grid)
 
+        # Energy window around the band edge: above the CBM for electrons, below the VBM
+        # for holes (ecbm holds the VBM energy when ishole is set).
         if self.ishole:
             efocus_min = ecbm - self.over_vbm
             efocus_max = ecbm
@@ -2386,6 +2388,8 @@ class EPC_calculator(object):
         nks = len(k_grid)
         nqs = len(q_grid)
 
+        # Energy window around the band edge: above the CBM for electrons, below the VBM
+        # for holes (ecbm holds the VBM energy when ishole is set).
         if self.ishole:
             efocus_min = ecbm - self.over_vbm
             efocus_max = ecbm
